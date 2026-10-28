@@ -1,0 +1,51 @@
+name: Turbo
+
+# CI for the fork, next to upstream's main.yml (which lints, builds and tests on `main` and on
+# every pull request): checks that the published package contains no test files and ships
+# both licenses.
+
+on:
+  push:
+    branches: [main, "turbo/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  pack:
+    name: Pack
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          cache: true
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Pack
+        run: |
+          cd packages/core
+          pnpm pack --pack-destination "$RUNNER_TEMP"
+          # Note: Test helpers must not ship; both licenses must.
+          if tar tzf "$RUNNER_TEMP"/ponder-*.tgz | grep -E '_test/|\.test\.'; then
+            echo "test files in the package" && exit 1
+          fi
+          for f in LICENSE LICENSE-ELASTIC; do
+            tar tzf "$RUNNER_TEMP"/ponder-*.tgz | grep -qx "package/$f" || { echo "$f missing" && exit 1; }
+          done

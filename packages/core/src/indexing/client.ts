@@ -1,15 +1,19 @@
 import {
   type Abi,
+  type AbiFunction,
+  type AbiParameter,
   type Account,
   BlockNotFoundError,
   type Client,
   type ContractFunctionArgs,
   type ContractFunctionName,
   type ContractFunctionParameters,
+  concatHex,
   createClient,
   custom,
   decodeFunctionData,
   decodeFunctionResult,
+  encodeAbiParameters,
   encodeFunctionData,
   encodeFunctionResult,
   type GetBlockReturnType,
@@ -56,6 +60,7 @@ import { orderObject } from "@/utils/order.js";
 import { startClock } from "@/utils/timer.js";
 import { wait } from "@/utils/wait.js";
 import {
+  conditionOf,
   getProfilePatternKey,
   recordProfilePattern,
   recoverProfilePattern,
@@ -63,9 +68,17 @@ import {
 
 export type CachedViemClient = {
   getClient: (chain: Chain) => ReadonlyClient;
-  prefetch: (params: { events: Event[] }) => Promise<void>;
+  /**
+   * Predict and load the contract reads of `events`. With `keep`, the loaded results survive
+   * the next {@link CachedViemClient.clear} (a prefetch for the following batch).
+   */
+  prefetch: (params: { events: Event[]; keep?: boolean }) => Promise<void>;
   clear: () => void;
   event: Event | SetupEvent | undefined;
+  /** Incremented whenever the profile gains a pattern (predictions may have changed). */
+  readonly profileVersion: number;
+  /** Called when the profile gains a pattern, while the call that taught it is in flight. */
+  onProfileChange: (() => void) | undefined;
 };
 
 const MULTICALL_SELECTOR = toFunctionSelector(
@@ -73,9 +86,25 @@ const MULTICALL_SELECTOR = toFunctionSelector(
 );
 
 const SAMPLING_RATE = 10;
+
+/**
+ * Whether the calls of an event are profiled: every event until an event name has
+ * `SAMPLING_RATE` of them (so a batch's calls can be predicted after its first events), then
+ * one in `SAMPLING_RATE`.
+ */
+const isSampled = (eventCount: number) =>
+  eventCount < SAMPLING_RATE || eventCount % SAMPLING_RATE === 1;
 const DB_PREDICTION_THRESHOLD = 0.2;
 const RPC_PREDICTION_THRESHOLD = 0.8;
 const MAX_CONSTANT_PATTERN_COUNT = 10;
+/** Below this share of predicted requests found cached, prefetch skips the lookup... */
+const DB_SKIP_HIT_RATE = 0.01;
+/** ...judged on a lookup of at least this many requests... */
+const DB_SKIP_MIN_REQUESTS = 100;
+/** ...and looks again after this many skipped prefetches. */
+const DB_RECHECK_INTERVAL = 10;
+/** Constant patterns recorded per contract ({@link ProfilePattern.when}), per event name. */
+const MAX_CONDITIONAL_PATTERN_COUNT = 1_000;
 
 /**
  * RPC responses that are not cached. These are valid responses
@@ -346,6 +375,8 @@ export type ProfilePattern = Pick<
     | { type: "derived"; value: string[] }
   )[];
   cache?: "immutable";
+  /** For a pattern with constants: the contract of the log events it was recorded for. */
+  when?: string;
 };
 /**
  * Serialized {@link ProfilePattern} for unique identification.
@@ -395,13 +426,60 @@ export const getCacheKey = (request: RequestParameters) => {
   return toLowerCase(JSON.stringify(orderObject(request)));
 };
 
+/** Per ABI and function name: the function's selector and inputs, when it is not overloaded. */
+const functionEncodings = new WeakMap<
+  Abi,
+  Map<string, { selector: Hex; inputs: readonly AbiParameter[] } | null>
+>();
+
+/**
+ * `encodeFunctionData`, with the function selector computed once per ABI and function name
+ * instead of hashing the signature on every call.
+ */
+export const encodeCallData = ({
+  abi,
+  functionName,
+  args,
+}: {
+  abi: Abi;
+  functionName: string;
+  args?: readonly unknown[];
+}): Hex => {
+  let byName = functionEncodings.get(abi);
+  if (byName === undefined) {
+    byName = new Map();
+    functionEncodings.set(abi, byName);
+  }
+  let encoding = byName.get(functionName);
+  if (encoding === undefined) {
+    const items = abi.filter(
+      (item): item is AbiFunction =>
+        item.type === "function" && item.name === functionName,
+    );
+    encoding =
+      items.length === 1
+        ? { selector: toFunctionSelector(items[0]!), inputs: items[0]!.inputs }
+        : null;
+    byName.set(functionName, encoding);
+  }
+  // Note: Overloads are resolved from the arguments by viem.
+  if (encoding === null) {
+    return encodeFunctionData({ abi, functionName, args } as any);
+  }
+  if (encoding.inputs.length === 0) return encoding.selector;
+  return concatHex([
+    encoding.selector,
+    encodeAbiParameters(encoding.inputs, (args ?? []) as readonly unknown[]),
+  ]);
+};
+
 export const encodeRequest = (request: Request) =>
   ({
     method: "eth_call",
     params: [
       {
         to: request.address,
-        data: encodeFunctionData({
+        data: encodeCallData({
           abi: request.abi,
           functionName: request.functionName,
           args: request.args,
@@ -435,6 +513,63 @@ export const createCachedViemClient = ({
   const cache: Cache = new Map();
   const profile: Profile = new Map();
   const profileConstantLRU: ProfileConstantLRU = new Map();
+  const profileConditionalLRU: ProfileConstantLRU = new Map();
+  let profileVersion = 0;
+  /** `cache`, under a name the action wrappers do not shadow. */
+  const resultCache = cache;
+  const keepKey = (chainId: number, key: string) => {
+    if (keptKeys.has(chainId) === false) keptKeys.set(chainId, new Set());
+    keptKeys.get(chainId)!.add(key);
+  };
+  /** Per chain: cache keys loaded by a `keep` prefetch, kept by the next `clear`. */
+  const keptKeys = new Map<number, Set<string>>();
+  /** Per chain: results to write to `ponder_sync`, flushed once per event loop turn. */
+  const pendingInserts = new Map<
+    number,
+    {
+      request: RequestParameters;
+      blockNumber: number | undefined;
+      result: string;
+    }[]
+  >();
+  let isInsertScheduled = false;
+  const queueInsert = (
+    chainId: number,
+    entry: {
+      request: RequestParameters;
+      blockNumber: number | undefined;
+      result: string;
+    },
+  ) => {
+    if (pendingInserts.has(chainId) === false) pendingInserts.set(chainId, []);
+    pendingInserts.get(chainId)!.push(entry);
+    if (isInsertScheduled) return;
+    isInsertScheduled = true;
+    setImmediate(() => {
+      isInsertScheduled = false;
+      for (const [chainId, requests] of pendingInserts) {
+        // Note: As for a single request, a failed insert only costs the cache entry.
+        syncStore
+          .insertRpcRequestResults({ requests, chainId })
+          .catch(() => {});
+      }
+      pendingInserts.clear();
+    });
+  };
+  let onProfileChange: (() => void) | undefined;
+  /** Sampled log events per event name and contract (see {@link ProfilePattern.when}). */
+  const sampledLogEvents = new Map<EventName, Map<string, number>>();
+  /** Sampled events per event name: the denominator of a prediction's expected use. */
+  const sampledEvents = new Map<EventName, number>();
+  /** Per chain: share of the last cache lookup's requests found, prefetches since. */
+  const dbLookup = new Map<number, { hitRate: number; skipped: number }>();
+
+  const constantLRU = (eventName: EventName, pattern: ProfilePattern) => {
+    const lrus =
+      pattern.when === undefined ? profileConstantLRU : profileConditionalLRU;
+    if (lrus.has(eventName) === false) lrus.set(eventName, new Set());
+    return lrus.get(eventName)!;
+  };
 
   for (const chain of indexingBuild.chains) {
     cache.set(chain.id, new Map());
@@ -464,26 +599,30 @@ export const createCachedViemClient = ({
         profile.get(eventName)!.get(profilePatternKey)!.count++;
 
         if (hasConstant) {
-          profileConstantLRU.get(eventName)!.delete(profilePatternKey);
-          profileConstantLRU.get(eventName)!.add(profilePatternKey);
+          const lru = constantLRU(eventName, pattern);
+          lru.delete(profilePatternKey);
+          lru.add(profilePatternKey);
         }
       } else {
         profile
           .get(eventName)!
           .set(profilePatternKey, { pattern, hasConstant, count: 1 });
+        profileVersion++;
+        onProfileChange?.();
 
         if (hasConstant) {
-          profileConstantLRU.get(eventName)!.add(profilePatternKey);
+          const lru = constantLRU(eventName, pattern);
+          lru.add(profilePatternKey);
           if (
-            profileConstantLRU.get(eventName)!.size > MAX_CONSTANT_PATTERN_COUNT
+            lru.size >
+            (pattern.when === undefined
+              ? MAX_CONSTANT_PATTERN_COUNT
+              : MAX_CONDITIONAL_PATTERN_COUNT)
           ) {
-            const firstKey = profileConstantLRU
-              .get(eventName)!
-              .keys()
-              .next().value;
+            const firstKey = lru.keys().next().value;
             if (firstKey) {
               profile.get(eventName)!.delete(firstKey);
-              profileConstantLRU.get(eventName)!.delete(firstKey);
+              lru.delete(firstKey);
             }
           }
         }
@@ -505,7 +644,7 @@ export const createCachedViemClient = ({
         if (
           event.type !== "setup" &&
           userBlockNumber === undefined &&
-          eventCount[event.eventCallback.name]! % SAMPLING_RATE === 1
+          isSampled(eventCount[event.eventCallback.name]!)
         ) {
           const eventName = event.eventCallback.name;
 
@@ -549,13 +688,68 @@ export const createCachedViemClient = ({
         const blockNumber =
           event.type === "setup" ? event.block : event.event.block.number;
 
-        // @ts-expect-error
-        return _publicActions[action]({
-          ...args,
-          ...(cache === "immutable"
-            ? { blockTag: "latest" }
-            : { blockNumber: userBlockNumber ?? blockNumber }),
-        } as Parameters<ReturnType<typeof publicActions>[action]>[0]);
+        const viemAction = () =>
+          // @ts-expect-error
+          _publicActions[action]({
+            ...args,
+            ...(cache === "immutable"
+              ? { blockTag: "latest" }
+              : { blockNumber: userBlockNumber ?? blockNumber }),
+          } as Parameters<ReturnType<typeof publicActions>[action]>[0]);
+
+        // Note: A read that was prefetched is answered from the cache directly, without
+        // encoding it again and going through the transport; anything else (a miss, an
+        // error, an empty result) takes the viem path, which reports errors as usual.
+        if (action === "readContract" && event.type !== "setup") {
+          const read = args as unknown as Parameters<
+            PonderActions["readContract"]
+          >[0];
+          const chainId = event.chain.id;
+          const requestBlock =
+            cache === "immutable" ? "latest" : (userBlockNumber ?? blockNumber);
+          const request = encodeRequest({
+            address: read.address,
+            abi: read.abi as Abi,
+            functionName: read.functionName,
+            args: read.args as readonly unknown[] | undefined,
+            blockNumber: requestBlock,
+            chainId,
+          });
+          const cached = resultCache.get(chainId)?.get(getCacheKey(request));
+          if (cached !== undefined) {
+            return (async () => {
+              const result = cached instanceof Promise ? await cached : cached;
+              if (typeof result !== "string") return viemAction();
+              const data = decodeResponse(result);
+              if (typeof data !== "string" || data === "0x")
+                return viemAction();
+              common.metrics.ponder_indexing_rpc_requests_total.inc({
+                chain: event.chain.name,
+                method: "eth_call",
+                type:
+                  cached instanceof Promise
+                    ? "prefetch_rpc"
+                    : "prefetch_database",
+              });
+              if (cached instanceof Promise) {
+                queueInsert(chainId, {
+                  request,
+                  blockNumber:
+                    requestBlock === "latest" ? 0 : Number(requestBlock),
+                  result,
+                });
+              }
+              return decodeFunctionResult({
+                abi: read.abi as Abi,
+                functionName: read.functionName,
+                args: read.args as readonly unknown[] | undefined,
+                data: data as Hex,
+              });
+            })();
+          }
+        }
+
+        return viemAction();
       };
     };
 
@@ -680,7 +874,7 @@ export const createCachedViemClient = ({
         // @ts-expect-error overriding `readContract` is not supported by viem
       }).extend(ponderActions);
     },
-    async prefetch({ events }) {
+    async prefetch({ events, keep = false }) {
       const context = {
         logger: common.logger.child({ action: "prefetch_rpc_requests" }),
       };
@@ -693,12 +887,24 @@ export const createCachedViemClient = ({
 
       for (const event of events) {
         if (profile.has(event.eventCallback.name)) {
+          const when = conditionOf(event);
           for (const [, { pattern, count }] of profile.get(
             event.eventCallback.name,
           )!) {
             // Expected value of times the prediction will be used.
-            const ev =
-              (count * SAMPLING_RATE) / eventCount[event.eventCallback.name]!;
+            let ev: number;
+            if (pattern.when === undefined) {
+              ev =
+                count /
+                (sampledEvents.get(event.eventCallback.name) ??
+                  Number.POSITIVE_INFINITY);
+            } else {
+              if (pattern.when !== when) continue;
+              ev =
+                count /
+                (sampledLogEvents.get(event.eventCallback.name)?.get(when) ??
+                  Number.POSITIVE_INFINITY);
+            }
             prediction.push({
               ev,
               request: recoverProfilePattern(pattern, event),
@@ -718,6 +924,12 @@ export const createCachedViemClient = ({
       for (const { ev, request } of dedupe(prediction, ({ request }) =>
         getCacheKey(encodeRequest(request)),
       )) {
+        // Note: Already cached or in flight (a prefetch of the same events ahead).
+        const key = getCacheKey(encodeRequest(request));
+        if (cache.get(request.chainId)!.has(key)) {
+          if (keep) keepKey(request.chainId, key);
+          continue;
+        }
         chainRequests.get(request.chainId)!.push({
           ev,
           request: encodeRequest(request),
@@ -746,13 +958,31 @@ export const createCachedViemClient = ({
               dbRequests.length,
             );
 
-            cachedResults = await syncStore.getRpcRequestResults(
-              {
-                requests: dbRequests.map(({ request }) => request),
-                chainId,
-              },
-              context,
-            );
+            // Note: When the previous lookups found (almost) nothing cached — a range indexed
+            // for the first time — the requests go out without waiting for another lookup;
+            // every `DB_RECHECK_INTERVAL`th prefetch still looks.
+            const state = dbLookup.get(chainId) ?? { hitRate: 1, skipped: 0 };
+            const skipLookup =
+              state.hitRate < DB_SKIP_HIT_RATE &&
+              state.skipped < DB_RECHECK_INTERVAL;
+            cachedResults = skipLookup
+              ? new Array<undefined>(dbRequests.length)
+              : await syncStore.getRpcRequestResults(
+                  {
+                    requests: dbRequests.map(({ request }) => request),
+                    chainId,
+                  },
+                  context,
+                );
+            if (skipLookup) {
+              state.skipped++;
+            } else if (dbRequests.length >= DB_SKIP_MIN_REQUESTS) {
+              state.hitRate =
+                cachedResults.filter((r) => r !== undefined).length /
+                dbRequests.length;
+              state.skipped = 0;
+            }
+            dbLookup.set(chainId, state);
           }
 
           for (let i = 0; i < dbRequests.length; i++) {
@@ -763,6 +993,7 @@ export const createCachedViemClient = ({
               cache
                 .get(chainId)!
                 .set(getCacheKey(request.request), cachedResult);
+              if (keep) keepKey(chainId, getCacheKey(request.request));
             } else if (request.ev > RPC_PREDICTION_THRESHOLD) {
               const resultPromise = rpc
                 .request(request.request, context)
@@ -779,6 +1010,7 @@ export const createCachedViemClient = ({
               cache
                 .get(chainId)!
                 .set(getCacheKey(request.request), resultPromise);
+              if (keep) keepKey(chainId, getCacheKey(request.request));
             }
           }
 
@@ -796,11 +1028,50 @@ export const createCachedViemClient = ({
     },
     clear() {
       for (const chain of indexingBuild.chains) {
-        cache.get(chain.id)!.clear();
+        const kept = keptKeys.get(chain.id);
+        const chainCache = cache.get(chain.id)!;
+        if (kept === undefined || kept.size === 0) {
+          chainCache.clear();
+          continue;
+        }
+        for (const key of chainCache.keys()) {
+          if (kept.has(key) === false) chainCache.delete(key);
+        }
       }
+      // Note: Kept entries are cleared with the batch they were loaded for.
+      keptKeys.clear();
+    },
+    get profileVersion() {
+      return profileVersion;
+    },
+    get onProfileChange() {
+      return onProfileChange;
+    },
+    set onProfileChange(callback: (() => void) | undefined) {
+      onProfileChange = callback;
     },
     set event(_event: Event | SetupEvent) {
       event = _event;
+      // Note: The same sampling as the profiling of the event's calls.
+      if (
+        _event.type !== "setup" &&
+        isSampled(eventCount[_event.eventCallback.name]!)
+      ) {
+        const name = _event.eventCallback.name;
+        sampledEvents.set(name, (sampledEvents.get(name) ?? 0) + 1);
+      }
+      if (
+        _event.type === "log" &&
+        isSampled(eventCount[_event.eventCallback.name]!)
+      ) {
+        const name = _event.eventCallback.name;
+        const when = conditionOf(_event)!;
+        if (sampledLogEvents.has(name) === false) {
+          sampledLogEvents.set(name, new Map());
+        }
+        const counts = sampledLogEvents.get(name)!;
+        counts.set(when, (counts.get(when) ?? 0) + 1);
+      }
     },
   };
 };

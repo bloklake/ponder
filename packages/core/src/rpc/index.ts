@@ -33,6 +33,7 @@ import { createQueue } from "@/utils/queue.js";
 import { startClock } from "@/utils/timer.js";
 import { wait } from "@/utils/wait.js";
 import type { DebugRpcSchema } from "../utils/debug.js";
+import { BATCH_METHODS, createBatcher, MAX_BATCH_SIZE } from "./batch.js";
 import { getHttpRpcClient } from "./http.js";
 
 export type RpcSchema = [
@@ -94,11 +95,37 @@ const LATENCY_HURDLE_RATE = 0.1;
 const EPSILON = 0.1;
 const INITIAL_MAX_RPS = 20;
 const MIN_RPS = 3;
-const MAX_RPS = 500;
+const MAX_RPS = 5000;
+/** Upper bound for a node on this machine or a private network. */
+const PRIVATE_MAX_RPS = 100_000;
 const RPS_INCREASE_FACTOR = 1.05;
 const RPS_DECREASE_FACTOR = 0.95;
 const RPS_INCREASE_QUALIFIER = 0.9;
 const SUCCESS_MULTIPLIER = 5;
+/** Multiplicative RPS increase while a bucket is in slow start (before its first rate limit). */
+const SLOW_START_FACTOR = 2;
+
+/** Loopback, `localhost` or a private (RFC 1918) IPv4 address. */
+export const isPrivateHost = (hostname: string) => {
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost") || host === "::1") {
+    return true;
+  }
+  const octets = host.split(".").map(Number);
+  if (
+    octets.length !== 4 ||
+    octets.some((o) => Number.isInteger(o) === false || o < 0 || o > 255)
+  ) {
+    return false;
+  }
+  const [a, b] = octets as [number, number, number, number];
+  return (
+    a === 127 ||
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+};
 
 type Bucket = {
   index: number;
@@ -111,6 +138,11 @@ type Bucket = {
   isActive: boolean;
   /** Is the bucket recently activated and yet to complete successful requests. */
   isWarmingUp: boolean;
+  /**
+   * Is the bucket probing for its rate limit. Cleared by the first rate limit or
+   * timeout, after which the limit only changes by small steps.
+   */
+  isSlowStart: boolean;
 
   latencyMetadata: {
     latencies: { value: number; success: boolean }[];
@@ -125,6 +157,8 @@ type Bucket = {
   consecutiveSuccessfulRequests: number;
   /** Maximum requests per second (dynamic). */
   rpsLimit: number;
+  /** Upper bound of `rpsLimit`. */
+  maxRps: number;
 
   request: EIP1193RequestFn<RpcSchema>;
 };
@@ -189,6 +223,21 @@ export const createRpc = ({
 }): Rpc => {
   let backends: { request: EIP1193RequestFn<RpcSchema>; hostname: string }[];
 
+  // Note: Batched methods have their own queue. Once every endpoint is known to accept
+  // batch requests, it allows `MAX_BATCH_SIZE` times the concurrency: the number of HTTP
+  // requests in flight stays within `concurrency`.
+  const batchSupport = new Map<number, boolean>();
+  const onBatchSupport = (index: number, supported: boolean) => {
+    batchSupport.set(index, supported);
+    const all =
+      batchSupport.size === backends.length &&
+      Array.from(batchSupport.values()).every((v) => v);
+    callQueue?.setParameters({
+      concurrency: all ? concurrency * MAX_BATCH_SIZE : concurrency,
+    });
+  };
+  let callQueue: ReturnType<typeof createRequestQueue> | undefined;
+
   let requestId: UUID | undefined;
 
   if (typeof chain.rpc === "string") {
@@ -200,10 +249,18 @@ export const createRpc = ({
         chain,
         timeout: 10_000,
       });
+      const batcher = createBatcher({
+        url: chain.rpc,
+        timeout: 10_000,
+        send: (body) => httpRpcClient.request({ body }),
+        onSupport: (supported) => onBatchSupport(0, supported),
+      });
+      batcher.probe();
       backends = [
         {
           request: custom({
             request(body) {
+              if (BATCH_METHODS.has(body.method)) return batcher.request(body);
               if (requestId) {
                 return httpRpcClient.request({
                   body,
@@ -234,7 +291,7 @@ export const createRpc = ({
       throw new Error(`Unsupported RPC URL protocol: ${protocol}`);
     }
   } else if (Array.isArray(chain.rpc)) {
-    backends = chain.rpc.map((rpc) => {
+    backends = chain.rpc.map((rpc, index) => {
       const protocol = new url.URL(rpc).protocol;
       const hostname = new url.URL(rpc).hostname;
 
@@ -244,9 +301,17 @@ export const createRpc = ({
           chain,
           timeout: 10_000,
         });
+        const batcher = createBatcher({
+          url: rpc,
+          timeout: 10_000,
+          send: (body) => httpRpcClient.request({ body }),
+          onSupport: (supported) => onBatchSupport(index, supported),
+        });
+        batcher.probe();
         return {
           request: custom({
             request(body) {
+              if (BATCH_METHODS.has(body.method)) return batcher.request(body);
               if (requestId) {
                 return httpRpcClient.request({
                   body,
@@ -307,6 +372,9 @@ export const createRpc = ({
         activeConnections: 0,
         isActive: true,
         isWarmingUp: false,
+        // Note: A node on this machine or a private network has no provider rate limit to
+        // probe for; it starts at the maximum and still backs off on rate limiting.
+        isSlowStart: isPrivateHost(hostname) === false,
 
         latencyMetadata: {
           latencies: [],
@@ -317,7 +385,8 @@ export const createRpc = ({
 
         rps: [],
         consecutiveSuccessfulRequests: 0,
-        rpsLimit: INITIAL_MAX_RPS,
+        rpsLimit: isPrivateHost(hostname) ? PRIVATE_MAX_RPS : INITIAL_MAX_RPS,
+        maxRps: isPrivateHost(hostname) ? PRIVATE_MAX_RPS : MAX_RPS,
 
         request,
       }) satisfies Bucket,
@@ -420,6 +489,37 @@ export const createRpc = ({
   };
 
   const increaseMaxRPS = (bucket: Bucket) => {
+    if (bucket.isSlowStart) {
+      // Note: Double the limit whenever the previous second was (nearly) saturated,
+      // so a provider that can serve N requests per second is found in ~log2(N)
+      // seconds instead of minutes. Demand below the limit (e.g. bounded by
+      // `concurrency` and latency) never qualifies, so the limit tracks real usage.
+      if (bucket.consecutiveSuccessfulRequests < bucket.rpsLimit) return;
+      const previous = Math.floor(Date.now() / 1000) - 1;
+      const last = bucket.rps.find((r) => r.timestamp === previous);
+      if (
+        last === undefined ||
+        last.count < bucket.rpsLimit * RPS_INCREASE_QUALIFIER
+      ) {
+        return;
+      }
+
+      bucket.rpsLimit = Math.min(
+        bucket.rpsLimit * SLOW_START_FACTOR,
+        bucket.maxRps,
+      );
+      bucket.consecutiveSuccessfulRequests = 0;
+
+      common.logger.debug({
+        msg: "Increased JSON-RPC provider RPS limit",
+        chain: chain.name,
+        chain_id: chain.id,
+        hostname: bucket.hostname,
+        rps_limit: Math.floor(bucket.rpsLimit),
+      });
+      return;
+    }
+
     if (bucket.rps.length < 10) return;
 
     if (
@@ -435,7 +535,10 @@ export const createRpc = ({
       }
     }
 
-    bucket.rpsLimit = Math.min(bucket.rpsLimit * RPS_INCREASE_FACTOR, MAX_RPS);
+    bucket.rpsLimit = Math.min(
+      bucket.rpsLimit * RPS_INCREASE_FACTOR,
+      bucket.maxRps,
+    );
     bucket.consecutiveSuccessfulRequests = 0;
 
     common.logger.debug({
@@ -447,221 +550,244 @@ export const createRpc = ({
     });
   };
 
-  const queue = createQueue<
-    Awaited<ReturnType<Rpc["request"]>>,
-    {
-      body: Parameters<Rpc["request"]>[0];
-      context?: Parameters<Rpc["request"]>[1];
-    }
-  >({
-    initialStart: true,
-    concurrency,
-    worker: async ({ body, context }) => {
-      const logger = context?.logger ?? common.logger;
+  function createRequestQueue() {
+    return createQueue<
+      Awaited<ReturnType<Rpc["request"]>>,
+      {
+        body: Parameters<Rpc["request"]>[0];
+        context?: Parameters<Rpc["request"]>[1];
+      }
+    >({
+      initialStart: true,
+      concurrency,
+      worker: async ({ body, context }) => {
+        const logger = context?.logger ?? common.logger;
 
-      for (let i = 0; i <= RETRY_COUNT; i++) {
-        let endClock = startClock();
-        const t = setTimeout(() => {
-          logger.warn({
-            msg: "Unable to find available JSON-RPC provider within expected time",
-            chain: chain.name,
-            chain_id: chain.id,
-            rate_limit: JSON.stringify(buckets.map((b) => b.rpsLimit)),
-            is_active: JSON.stringify(buckets.map((b) => b.isActive)),
-            is_warming_up: JSON.stringify(buckets.map((b) => b.isWarmingUp)),
-            duration: 15_000,
-          });
-        }, 15_000);
-        const bucket = await getBucket();
-        clearTimeout(t);
-        const getBucketDuration = endClock();
-        endClock = startClock();
-        const id = crypto.randomUUID();
+        for (let i = 0; i <= RETRY_COUNT; i++) {
+          let endClock = startClock();
+          const t = setTimeout(() => {
+            logger.warn({
+              msg: "Unable to find available JSON-RPC provider within expected time",
+              chain: chain.name,
+              chain_id: chain.id,
+              rate_limit: JSON.stringify(buckets.map((b) => b.rpsLimit)),
+              is_active: JSON.stringify(buckets.map((b) => b.isActive)),
+              is_warming_up: JSON.stringify(buckets.map((b) => b.isWarmingUp)),
+              duration: 15_000,
+            });
+          }, 15_000);
+          const bucket = await getBucket();
+          clearTimeout(t);
+          const getBucketDuration = endClock();
+          endClock = startClock();
+          const id = crypto.randomUUID();
 
-        const surpassTimeout = setTimeout(() => {
-          logger.warn({
-            msg: "JSON-RPC request unexpectedly surpassed timeout",
-            chain: chain.name,
-            chain_id: chain.id,
-            hostname: bucket.hostname,
-            request_id: id,
-            method: body.method,
-            duration: 15_000,
-          });
-        }, 15_000);
+          const surpassTimeout = setTimeout(() => {
+            logger.warn({
+              msg: "JSON-RPC request unexpectedly surpassed timeout",
+              chain: chain.name,
+              chain_id: chain.id,
+              hostname: bucket.hostname,
+              request_id: id,
+              method: body.method,
+              duration: 15_000,
+            });
+          }, 15_000);
 
-        try {
-          logger.trace({
-            msg: "Sent JSON-RPC request",
-            chain: chain.name,
-            chain_id: chain.id,
-            hostname: bucket.hostname,
-            request_id: id,
-            method: body.method,
-            duration: getBucketDuration,
-          });
+          try {
+            logger.trace({
+              msg: "Sent JSON-RPC request",
+              chain: chain.name,
+              chain_id: chain.id,
+              hostname: bucket.hostname,
+              request_id: id,
+              method: body.method,
+              duration: getBucketDuration,
+            });
 
-          // Add request per second data
-          const timestamp = Math.floor(Date.now() / 1000);
-          if (
-            bucket.rps.length === 0 ||
-            bucket.rps[bucket.rps.length - 1]!.timestamp < timestamp
-          ) {
-            bucket.rps.push({ count: 1, timestamp });
-          } else {
-            bucket.rps[bucket.rps.length - 1]!.count++;
-          }
+            // Add request per second data
+            const timestamp = Math.floor(Date.now() / 1000);
+            if (
+              bucket.rps.length === 0 ||
+              bucket.rps[bucket.rps.length - 1]!.timestamp < timestamp
+            ) {
+              bucket.rps.push({ count: 1, timestamp });
+            } else {
+              bucket.rps[bucket.rps.length - 1]!.count++;
+            }
 
-          requestId = id;
-          const response = await bucket.request(body);
+            requestId = id;
+            const response = await bucket.request(body);
 
-          if (response === undefined) {
-            throw new Error("Response is undefined");
-          }
+            if (response === undefined) {
+              throw new Error("Response is undefined");
+            }
 
-          if (
-            response === null &&
-            (body.method === "eth_getBlockByNumber" ||
-              body.method === "eth_getBlockByHash") &&
-            context?.retryNullBlockRequest === true
-          ) {
-            // Note: Throwing this error will cause the request to be retried.
-            throw new BlockNotFoundError({
+            if (
+              response === null &&
+              (body.method === "eth_getBlockByNumber" ||
+                body.method === "eth_getBlockByHash") &&
+              context?.retryNullBlockRequest === true
+            ) {
+              // Note: Throwing this error will cause the request to be retried.
+              throw new BlockNotFoundError({
+                // @ts-expect-error
+                blockNumber: body.params[0],
+              });
+            }
+
+            const duration = endClock();
+
+            logger.trace({
+              msg: "Received JSON-RPC response",
+              chain: chain.name,
+              chain_id: chain.id,
+              hostname: bucket.hostname,
+              request_id: id,
+              method: body.method,
+              duration,
+            });
+
+            common.metrics.ponder_rpc_request_duration.observe(
+              { method: body.method, chain: chain.name },
+              duration,
+            );
+
+            addLatency(bucket, duration, true);
+
+            bucket.consecutiveSuccessfulRequests++;
+            increaseMaxRPS(bucket);
+
+            bucket.isWarmingUp = false;
+            bucket.reactivationDelay = INITIAL_REACTIVATION_DELAY;
+
+            return response as RequestReturnType<typeof body.method>;
+          } catch (e) {
+            const error = e as Error;
+
+            common.metrics.ponder_rpc_request_error_total.inc(
+              { method: body.method, chain: chain.name },
+              1,
+            );
+
+            if (
+              body.method === "eth_getLogs" &&
+              isHex(body.params[0].fromBlock) &&
+              isHex(body.params[0].toBlock) &&
+              chain.ethGetLogsBlockRange === undefined
+            ) {
+              const getLogsErrorResponse = getLogsRetryHelper({
+                params: body.params as GetLogsRetryHelperParameters["params"],
+                error: error as RpcError,
+              });
+
+              if (getLogsErrorResponse.shouldRetry) {
+                common.logger.trace({
+                  msg: "Caught eth_getLogs range error",
+                  chain: chain.name,
+                  chain_id: chain.id,
+                  hostname: bucket.hostname,
+                  request_id: id,
+                  method: body.method,
+                  request: JSON.stringify(body),
+                  retry_ranges: JSON.stringify(getLogsErrorResponse.ranges),
+                  error: error as Error,
+                });
+
+                throw error;
+              } else {
+                // @ts-expect-error
+                error.meta = [
+                  "Tip: Use the ethGetLogsBlockRange option to override the default behavior for this chain",
+                ];
+              }
+            }
+
+            addLatency(bucket, endClock(), false);
+
+            if (
               // @ts-expect-error
-              blockNumber: body.params[0],
-            });
-          }
+              error.code === 429 ||
+              // @ts-expect-error
+              error.status === 429 ||
+              error instanceof TimeoutError
+            ) {
+              if (bucket.isActive) {
+                bucket.isActive = false;
+                bucket.isWarmingUp = false;
 
-          const duration = endClock();
+                // Note: The first rate limit ends slow start. The limit that was just
+                // exceeded is at most double the last one that worked, so halve it.
+                bucket.rpsLimit = Math.max(
+                  bucket.rpsLimit *
+                    (bucket.isSlowStart
+                      ? 1 / SLOW_START_FACTOR
+                      : RPS_DECREASE_FACTOR),
+                  MIN_RPS,
+                );
+                bucket.isSlowStart = false;
+                bucket.consecutiveSuccessfulRequests = 0;
 
-          logger.trace({
-            msg: "Received JSON-RPC response",
-            chain: chain.name,
-            chain_id: chain.id,
-            hostname: bucket.hostname,
-            request_id: id,
-            method: body.method,
-            duration,
-          });
+                common.logger.debug({
+                  msg: "JSON-RPC provider rate limited",
+                  chain: chain.name,
+                  chain_id: chain.id,
+                  hostname: bucket.hostname,
+                  rps_limit: Math.floor(bucket.rpsLimit),
+                });
 
-          common.metrics.ponder_rpc_request_duration.observe(
-            { method: body.method, chain: chain.name },
-            duration,
-          );
+                scheduleBucketActivation(bucket);
 
-          addLatency(bucket, duration, true);
+                if (buckets.every((b) => b.isActive === false)) {
+                  logger.warn({
+                    msg: "All JSON-RPC providers are inactive",
+                    chain: chain.name,
+                    chain_id: chain.id,
+                  });
+                }
 
-          bucket.consecutiveSuccessfulRequests++;
-          increaseMaxRPS(bucket);
+                bucket.reactivationDelay =
+                  error instanceof TimeoutError
+                    ? INITIAL_REACTIVATION_DELAY
+                    : Math.min(
+                        bucket.reactivationDelay * BACKOFF_FACTOR,
+                        MAX_REACTIVATION_DELAY,
+                      );
+              }
+            }
 
-          bucket.isWarmingUp = false;
-          bucket.reactivationDelay = INITIAL_REACTIVATION_DELAY;
-
-          return response as RequestReturnType<typeof body.method>;
-        } catch (e) {
-          const error = e as Error;
-
-          common.metrics.ponder_rpc_request_error_total.inc(
-            { method: body.method, chain: chain.name },
-            1,
-          );
-
-          if (
-            body.method === "eth_getLogs" &&
-            isHex(body.params[0].fromBlock) &&
-            isHex(body.params[0].toBlock) &&
-            chain.ethGetLogsBlockRange === undefined
-          ) {
-            const getLogsErrorResponse = getLogsRetryHelper({
-              params: body.params as GetLogsRetryHelperParameters["params"],
-              error: error as RpcError,
-            });
-
-            if (getLogsErrorResponse.shouldRetry) {
-              common.logger.trace({
-                msg: "Caught eth_getLogs range error",
+            if (shouldRetry(error) === false) {
+              logger.warn({
+                msg: "Received JSON-RPC error",
                 chain: chain.name,
                 chain_id: chain.id,
                 hostname: bucket.hostname,
                 request_id: id,
                 method: body.method,
                 request: JSON.stringify(body),
-                retry_ranges: JSON.stringify(getLogsErrorResponse.ranges),
-                error: error as Error,
+                duration: endClock(),
+                error,
               });
-
               throw error;
-            } else {
-              // @ts-expect-error
-              error.meta = [
-                "Tip: Use the ethGetLogsBlockRange option to override the default behavior for this chain",
-              ];
             }
-          }
 
-          addLatency(bucket, endClock(), false);
-
-          if (
-            // @ts-expect-error
-            error.code === 429 ||
-            // @ts-expect-error
-            error.status === 429 ||
-            error instanceof TimeoutError
-          ) {
-            if (bucket.isActive) {
-              bucket.isActive = false;
-              bucket.isWarmingUp = false;
-
-              bucket.rpsLimit = Math.max(
-                bucket.rpsLimit * RPS_DECREASE_FACTOR,
-                MIN_RPS,
-              );
-              bucket.consecutiveSuccessfulRequests = 0;
-
-              common.logger.debug({
-                msg: "JSON-RPC provider rate limited",
+            if (i === RETRY_COUNT) {
+              logger.warn({
+                msg: "Received JSON-RPC error",
                 chain: chain.name,
                 chain_id: chain.id,
                 hostname: bucket.hostname,
-                rps_limit: Math.floor(bucket.rpsLimit),
+                request_id: id,
+                method: body.method,
+                request: JSON.stringify(body),
+                duration: endClock(),
+                retry_count: i + 1,
+                error,
               });
-
-              scheduleBucketActivation(bucket);
-
-              if (buckets.every((b) => b.isActive === false)) {
-                logger.warn({
-                  msg: "All JSON-RPC providers are inactive",
-                  chain: chain.name,
-                  chain_id: chain.id,
-                });
-              }
-
-              bucket.reactivationDelay =
-                error instanceof TimeoutError
-                  ? INITIAL_REACTIVATION_DELAY
-                  : Math.min(
-                      bucket.reactivationDelay * BACKOFF_FACTOR,
-                      MAX_REACTIVATION_DELAY,
-                    );
+              throw error;
             }
-          }
 
-          if (shouldRetry(error) === false) {
-            logger.warn({
-              msg: "Received JSON-RPC error",
-              chain: chain.name,
-              chain_id: chain.id,
-              hostname: bucket.hostname,
-              request_id: id,
-              method: body.method,
-              request: JSON.stringify(body),
-              duration: endClock(),
-              error,
-            });
-            throw error;
-          }
-
-          if (i === RETRY_COUNT) {
+            const duration = BASE_DURATION * 2 ** i;
             logger.warn({
               msg: "Received JSON-RPC error",
               chain: chain.name,
@@ -672,36 +798,25 @@ export const createRpc = ({
               request: JSON.stringify(body),
               duration: endClock(),
               retry_count: i + 1,
+              retry_delay: duration,
               error,
             });
-            throw error;
+            await wait(duration);
+          } finally {
+            bucket.activeConnections--;
+
+            clearTimeout(surpassTimeout);
           }
-
-          const duration = BASE_DURATION * 2 ** i;
-          logger.warn({
-            msg: "Received JSON-RPC error",
-            chain: chain.name,
-            chain_id: chain.id,
-            hostname: bucket.hostname,
-            request_id: id,
-            method: body.method,
-            request: JSON.stringify(body),
-            duration: endClock(),
-            retry_count: i + 1,
-            retry_delay: duration,
-            error,
-          });
-          await wait(duration);
-        } finally {
-          bucket.activeConnections--;
-
-          clearTimeout(surpassTimeout);
         }
-      }
 
-      throw "unreachable";
-    },
-  });
+        throw "unreachable";
+      },
+    });
+  }
+
+  const queue = createRequestQueue();
+  callQueue = createRequestQueue();
+  const batchedQueue = callQueue;
 
   let ws: WebSocket | undefined;
   let isUnsubscribed = false;
@@ -711,8 +826,12 @@ export const createRpc = ({
 
   const rpc: Rpc = {
     hostnames: backends.map((backend) => backend.hostname),
-    // @ts-expect-error
-    request: (parameters, context) => queue.add({ body: parameters, context }),
+    request: (parameters, context) =>
+      // @ts-expect-error
+      (BATCH_METHODS.has(parameters.method) ? batchedQueue : queue).add({
+        body: parameters,
+        context,
+      }),
     subscribe({ onBlock, onError }) {
       (async () => {
         while (true) {

@@ -170,7 +170,12 @@ If you're interested in contributing to Ponder, please read the [contribution gu
 
 ## About
 
-Ponder is MIT-licensed open-source software.
+This is Bloklake's fork of Ponder. Bloklake's changes are licensed under the
+[Elastic License 2.0](LICENSE-ELASTIC): you may use and run them yourself, but not offer them to
+others as a hosted or managed service. See [LICENSING.md](LICENSING.md) for which code is under
+which license.
+
+Upstream Ponder is MIT-licensed open-source software.
 
 [ci-badge]: https://github.com/ponder-sh/ponder/actions/workflows/main.yml/badge.svg
 [ci-url]: https://github.com/ponder-sh/ponder/actions/workflows/main.yml

@@ -21,6 +21,7 @@ import type {
   SyncLog,
   SyncTrace,
   SyncTransaction,
+  SyncTransactionReceipt,
   TraceFilter,
   TransactionFilter,
   TransferFilter,
@@ -810,25 +811,64 @@ export const createHistoricalSync = (
         // Free memory of all unused transactions
         block.transactions = transactions;
 
+        pending.blocks.push(block);
+        pending.transactions.push(...transactions);
+        pending.transactionReceipts.push(...transactionReceipts);
+        for (const trace of traces) {
+          pending.traces.push({
+            trace,
+            block: block!,
+            transaction: transactionsByHash.get(trace.transactionHash)!,
+          });
+        }
+        pending.logs.push(...logs);
+
+        if (pending.blocks.length >= INSERT_BATCH_BLOCKS) {
+          await flushPending();
+        }
+      };
+
+      // Note: Rows are buffered and inserted for many blocks at a time. One insert
+      // per table per block made the database round trips, not the RPC, the limit
+      // on a fast RPC. Every buffered row is inserted before this function returns,
+      // so the interval is only marked complete after its data is written.
+      const INSERT_BATCH_BLOCKS = 250;
+      const createPending = () => ({
+        blocks: [] as SyncBlock[],
+        transactions: [] as SyncTransaction[],
+        transactionReceipts: [] as SyncTransactionReceipt[],
+        traces: [] as {
+          trace: SyncTrace;
+          block: SyncBlock;
+          transaction: SyncTransaction;
+        }[],
+        logs: [] as SyncLog[],
+      });
+      let pending = createPending();
+
+      const flushPending = async () => {
+        if (pending.blocks.length === 0) return;
+        const batch = pending;
+        pending = createPending();
+
         await promiseAllSettledWithThrow([
-          syncStore.insertBlocks({ blocks: [block], chainId: args.chain.id }),
+          syncStore.insertBlocks({
+            blocks: batch.blocks,
+            chainId: args.chain.id,
+          }),
           syncStore.insertTransactions({
-            transactions,
+            transactions: batch.transactions,
             chainId: args.chain.id,
           }),
           syncStore.insertTransactionReceipts({
-            transactionReceipts,
+            transactionReceipts: batch.transactionReceipts,
             chainId: args.chain.id,
           }),
           syncStore.insertTraces({
-            traces: traces.map((trace) => ({
-              trace,
-              block: block!,
-              transaction: transactionsByHash.get(trace.transactionHash)!,
-            })),
+            traces: batch.traces,
             chainId: args.chain.id,
           }),
-          syncStore.insertLogs({ logs, chainId: args.chain.id }),
+          syncStore.insertLogs({ logs: batch.logs, chainId: args.chain.id }),
         ]);
       };
 
@@ -837,7 +877,14 @@ export const createHistoricalSync = (
       let receiptCount = 0;
       let traceCount = 0;
 
-      const MAX_BLOCKS_IN_MEM = 100;
+      // Note: Blocks are requested with the same concurrency as the RPC client,
+      // so a high-latency provider is not left idle (100 in flight at 300 ms is only
+      // ~330 requests per second). Fetched blocks are reduced to the required
+      // transactions right away, so memory stays bounded by in-flight requests.
+      const MAX_BLOCKS_IN_MEM = Math.max(
+        args.common.options.rpcMaxConcurrency,
+        100,
+      );
 
       if (requiredIntervals.length > 0) {
         const queue = createQueue({
@@ -850,6 +897,7 @@ export const createHistoricalSync = (
         await Promise.all(
           intervalRange(interval).map((blockNumber) => queue.add(blockNumber)),
         );
+        await flushPending();
       }
 
       args.common.logger.debug(

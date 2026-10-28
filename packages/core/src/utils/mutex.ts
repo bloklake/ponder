@@ -5,6 +5,8 @@ import {
 
 export const createLock = (): {
   lock: () => Promise<void>;
+  /** Acquire the lock synchronously if it is free. */
+  tryLock: () => boolean;
   unlock: () => void;
 } => {
   const queue: PromiseWithResolvers<void>[] = [];
@@ -20,6 +22,11 @@ export const createLock = (): {
       const pwr = promiseWithResolvers<void>();
       queue.push(pwr);
       return pwr.promise;
+    },
+    tryLock: () => {
+      if (locked) return false;
+      locked = true;
+      return true;
     },
     unlock: () => {
       if (queue.length > 0) {

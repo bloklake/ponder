@@ -303,6 +303,7 @@ export type Chain = {
   reorgWindow: number;
   cacheRpcRequests: boolean;
   ethGetLogsBlockRange: number | undefined;
+  datalake?: { url: string; apiKey?: string };
   viemChain: ViemChain | undefined;
 };
 

@@ -155,3 +155,26 @@ export function createCallbackGenerator<T>(
 
   return { callback, generator: generator() };
 }
+
+/**
+ * Yields the results of an async generator, requesting the next result as soon as the
+ * current one is yielded (so it is produced while the consumer works), and calls `onNext`
+ * with it when it is ready.
+ */
+export async function* lookaheadAsyncGenerator<T>(
+  generator: AsyncGenerator<T>,
+  onNext: (value: T) => void,
+): AsyncGenerator<T> {
+  let next = generator.next();
+  while (true) {
+    const result = await next;
+    if (result.done) return;
+    next = generator.next();
+    next
+      .then((r) => {
+        if (r.done !== true) onNext(r.value);
+      })
+      .catch(() => {});
+    yield result.value;
+  }
+}

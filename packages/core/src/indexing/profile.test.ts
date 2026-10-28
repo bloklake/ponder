@@ -5,7 +5,11 @@ import { erc20ABI } from "@/_test/generated.js";
 import { getBlocksIndexingBuild, getChain } from "@/_test/utils.js";
 import type { BlockEvent, LogEvent, TraceEvent } from "@/internal/types.js";
 import { ZERO_CHECKPOINT_STRING } from "@/utils/checkpoint.js";
-import { recordProfilePattern, recoverProfilePattern } from "./profile.js";
+import {
+  getProfilePatternKey,
+  recordProfilePattern,
+  recoverProfilePattern,
+} from "./profile.js";
 
 test("recordProfilePattern() with undefined log event args", () => {
   const { eventCallbacks } = getBlocksIndexingBuild({ interval: 1 });
@@ -996,4 +1000,102 @@ test("recordProfilePattern() cache immutable", () => {
       "functionName": "balanceOf",
     }
   `);
+});
+
+test("recordProfilePattern() constants per contract", () => {
+  const { eventCallbacks } = getBlocksIndexingBuild({ interval: 1 });
+  const POOL_A = "0x000000000000000000000000000000000000000A";
+  const POOL_B = "0x000000000000000000000000000000000000000b";
+  const eventOf = (address: `0x${string}`) =>
+    ({
+      type: "log",
+      chain: getChain(),
+      checkpoint: ZERO_CHECKPOINT_STRING,
+      eventCallback: eventCallbacks[0]!,
+      event: {
+        id: ZERO_CHECKPOINT_STRING,
+        args: undefined,
+        log: { address } as unknown as LogEvent["event"]["log"],
+        transaction: {} as LogEvent["event"]["transaction"],
+        block: { number: 5n } as BlockEvent["event"]["block"],
+      },
+    }) satisfies LogEvent;
+  // Note: The token address comes from the database, not from the event.
+  const balanceOf = (pool: `0x${string}`) => ({
+    address: ALICE,
+    abi: [getAbiItem({ abi: erc20ABI, name: "balanceOf" })],
+    functionName: "balanceOf" as const,
+    args: [pool] as const,
+  });
+
+  const a = recordProfilePattern({
+    event: eventOf(POOL_A),
+    args: balanceOf(POOL_A),
+    hints: [],
+  });
+  expect(a).toMatchObject({
+    hasConstant: true,
+    pattern: {
+      address: { type: "constant", value: ALICE },
+      args: [{ type: "derived", value: ["log", "address"] }],
+      when: POOL_A.toLowerCase(),
+    },
+  });
+
+  // The pattern of pool A is not a hint for pool B.
+  const b = recordProfilePattern({
+    event: eventOf(POOL_B),
+    args: balanceOf(POOL_B),
+    hints: [a!],
+  });
+  expect(b).not.toBe(a);
+  expect(b!.pattern.when).toBe(POOL_B.toLowerCase());
+  expect(getProfilePatternKey(a!.pattern)).not.toBe(
+    getProfilePatternKey(b!.pattern),
+  );
+
+  // It is for pool A.
+  expect(
+    recordProfilePattern({
+      event: eventOf(POOL_A),
+      args: balanceOf(POOL_A),
+      hints: [b!, a!],
+    }),
+  ).toBe(a);
+});
+
+test("recordProfilePattern() hint with different args", () => {
+  const { eventCallbacks } = getBlocksIndexingBuild({ interval: 1 });
+  const event = {
+    type: "log",
+    chain: getChain(),
+    checkpoint: ZERO_CHECKPOINT_STRING,
+    eventCallback: eventCallbacks[0]!,
+    event: {
+      id: ZERO_CHECKPOINT_STRING,
+      args: { address: zeroAddress },
+      log: {} as unknown as LogEvent["event"]["log"],
+      transaction: {} as LogEvent["event"]["transaction"],
+      block: { number: 5n } as BlockEvent["event"]["block"],
+    },
+  } satisfies LogEvent;
+  const balanceOf = (owner: `0x${string}`) => ({
+    address: zeroAddress,
+    abi: [getAbiItem({ abi: erc20ABI, name: "balanceOf" })],
+    functionName: "balanceOf" as const,
+    args: [owner] as const,
+  });
+
+  const alice = recordProfilePattern({
+    event,
+    args: balanceOf(ALICE),
+    hints: [],
+  });
+  const bob = recordProfilePattern({
+    event,
+    args: balanceOf(BOB),
+    hints: [alice!],
+  });
+  expect(bob).not.toBe(alice);
+  expect(bob!.pattern.args).toEqual([{ type: "constant", value: BOB }]);
 });

@@ -2,8 +2,10 @@ import crypto from "node:crypto";
 import {
   and,
   asc,
+  Column,
   desc,
   eq,
+  getTableColumns,
   gte,
   inArray,
   lt,
@@ -12,11 +14,18 @@ import {
   type SQL,
   sql,
 } from "drizzle-orm";
+import { toSnakeCase } from "drizzle-orm/casing";
+
+const identityMapFromDriverValue = (Column.prototype as any).mapFromDriverValue;
+
 import {
+  getTableConfig,
   type PgColumn,
   type PgSelectBase,
+  type PgTable,
   unionAll,
 } from "drizzle-orm/pg-core";
+import type pg from "pg";
 import { type Address, hexToNumber, isHex } from "viem";
 import type { QB } from "@/database/queryBuilder.js";
 import { extractBlockNumberParam } from "@/indexing/client.js";
@@ -200,6 +209,192 @@ export type SyncStore = {
   ): Promise<void>;
 };
 
+/**
+ * `ponder_sync` rows (as selected, oldest first) → the internal event data of blocks up to
+ * `cursor` (inclusive): drops rows past the cursor, lowercases addresses, and maps
+ * transaction types, receipt statuses, access lists and log topics. Shared by the Postgres
+ * read path and the datalake source so both produce identical events.
+ */
+export const formatEventData = async ({
+  common,
+  blocksRows,
+  transactionsRows,
+  transactionReceiptsRows,
+  tracesRows,
+  logsRows,
+  cursor,
+}: {
+  common: Common;
+  blocksRows: any[];
+  transactionsRows: any[];
+  transactionReceiptsRows: any[];
+  tracesRows: any[];
+  logsRows: any[];
+  cursor: number;
+}): Promise<{
+  blocks: InternalBlock[];
+  logs: InternalLog[];
+  transactions: InternalTransaction[];
+  transactionReceipts: InternalTransactionReceipt[];
+  traces: InternalTrace[];
+  cursor: number;
+}> => {
+  const endClock = startClock();
+  for (let i = 0; i < blocksRows.length; i++) {
+    if (Number(blocksRows[i]!.number) > cursor) {
+      blocksRows.length = i;
+      break;
+    }
+
+    const block = blocksRows[i]!;
+
+    if (block.miner) {
+      block.miner = toLowerCase(block.miner as Address);
+    }
+  }
+
+  for (let i = 0; i < transactionsRows.length; i++) {
+    if (Number(transactionsRows[i]!.blockNumber) > cursor) {
+      transactionsRows.length = i;
+      break;
+    }
+
+    const transaction = transactionsRows[i]!;
+    const internalTransaction = transaction as unknown as InternalTransaction;
+
+    internalTransaction.blockNumber = Number(transaction.blockNumber);
+    internalTransaction.from = toLowerCase(transaction.from as Address);
+    if (transaction.to !== null) {
+      internalTransaction.to = toLowerCase(transaction.to as Address);
+    }
+
+    if (transaction.type === "0x0") {
+      internalTransaction.type = "legacy";
+      internalTransaction.accessList = undefined;
+      internalTransaction.maxFeePerGas = undefined;
+      internalTransaction.maxPriorityFeePerGas = undefined;
+    } else if (transaction.type === "0x1") {
+      internalTransaction.type = "eip2930";
+      internalTransaction.accessList =
+        transaction.accessList === undefined
+          ? undefined
+          : JSON.parse(transaction.accessList!);
+      internalTransaction.maxFeePerGas = undefined;
+      internalTransaction.maxPriorityFeePerGas = undefined;
+    } else if (transaction.type === "0x2") {
+      internalTransaction.type = "eip1559";
+      internalTransaction.gasPrice = undefined;
+      internalTransaction.accessList = undefined;
+    } else if (transaction.type === "0x7e") {
+      internalTransaction.type = "deposit";
+      internalTransaction.gasPrice = undefined;
+      internalTransaction.accessList = undefined;
+    }
+  }
+
+  for (let i = 0; i < transactionReceiptsRows.length; i++) {
+    if (Number(transactionReceiptsRows[i]!.blockNumber) > cursor) {
+      transactionReceiptsRows.length = i;
+      break;
+    }
+
+    const transactionReceipt = transactionReceiptsRows[i]!;
+
+    const internalTransactionReceipt =
+      transactionReceipt as unknown as InternalTransactionReceipt;
+
+    internalTransactionReceipt.blockNumber = Number(
+      transactionReceipt.blockNumber,
+    );
+    if (transactionReceipt.contractAddress) {
+      internalTransactionReceipt.contractAddress = toLowerCase(
+        transactionReceipt.contractAddress as Address,
+      );
+    }
+    internalTransactionReceipt.from = toLowerCase(
+      transactionReceipt.from as Address,
+    );
+    if (transactionReceipt.to !== null) {
+      internalTransactionReceipt.to = toLowerCase(
+        transactionReceipt.to as Address,
+      );
+    }
+    internalTransactionReceipt.status =
+      transactionReceipt.status === "0x1"
+        ? "success"
+        : transactionReceipt.status === "0x0"
+          ? "reverted"
+          : (transactionReceipt.status as InternalTransactionReceipt["status"]);
+    internalTransactionReceipt.type =
+      transactionReceipt.type === "0x0"
+        ? "legacy"
+        : transactionReceipt.type === "0x1"
+          ? "eip2930"
+          : transactionReceipt.type === "0x2"
+            ? "eip1559"
+            : transactionReceipt.type === "0x7e"
+              ? "deposit"
+              : transactionReceipt.type;
+  }
+
+  for (let i = 0; i < tracesRows.length; i++) {
+    if (Number(tracesRows[i]!.blockNumber) > cursor) {
+      tracesRows.length = i;
+      break;
+    }
+
+    const trace = tracesRows[i]!;
+    const internalTrace = trace as unknown as InternalTrace;
+
+    internalTrace.blockNumber = Number(trace.blockNumber);
+
+    internalTrace.from = toLowerCase(trace.from as Address);
+    if (trace.to !== null) {
+      internalTrace.to = toLowerCase(trace.to as Address);
+    }
+
+    if (trace.output === null) {
+      internalTrace.output = undefined;
+    }
+  }
+
+  for (let i = 0; i < logsRows.length; i++) {
+    if (Number(logsRows[i]!.blockNumber) > cursor) {
+      logsRows.length = i;
+      break;
+    }
+
+    const log = logsRows[i]!;
+    const internalLog = log as unknown as InternalLog;
+
+    internalLog.blockNumber = Number(log.blockNumber);
+    internalLog.address = toLowerCase(log.address as Address);
+    internalLog.removed = false;
+    internalLog.topics = [log.topic0, log.topic1, log.topic2, log.topic3];
+    log.topic0 = undefined;
+    log.topic1 = undefined;
+    log.topic2 = undefined;
+    log.topic3 = undefined;
+  }
+
+  common.metrics.ponder_historical_extract_duration.inc(
+    { step: "format" },
+    endClock(),
+  );
+
+  await new Promise(setImmediate);
+
+  return {
+    blocks: blocksRows as InternalBlock[],
+    logs: logsRows as InternalLog[],
+    transactions: transactionsRows as InternalTransaction[],
+    transactionReceipts:
+      transactionReceiptsRows as InternalTransactionReceipt[],
+    traces: tracesRows as InternalTrace[],
+    cursor,
+  };
+};
+
 export const createSyncStore = ({
   common,
   qb,
@@ -207,6 +402,136 @@ export const createSyncStore = ({
   common: Common;
   qb: QB<typeof PONDER_SYNC>;
 }): SyncStore => {
+  /**
+   * Multi-row `INSERT ... ON CONFLICT (target) DO NOTHING` with the SQL text built by
+   * hand. Drizzle's builder spends several microseconds per bound parameter, which made
+   * it the largest CPU cost of historical sync. Values go through each column's own
+   * `mapToDriverValue`, so the stored rows are the same.
+   */
+  /**
+   * Run a drizzle select and map its rows like drizzle does, without drizzle's
+   * per-field result mapping (a large CPU cost when reading back events). Each
+   * value still goes through its column's `mapFromDriverValue`. PGlite keeps the
+   * drizzle path. Note: drizzle's node-postgres driver only overrides the type
+   * parsers of timestamp, date and interval types, which `ponder_sync` event
+   * columns don't use.
+   */
+  const selectRows = async <query extends PromiseLike<unknown[]>>(
+    {
+      label,
+      query,
+      select,
+    }: {
+      label: string;
+      query: query & { toSQL: () => { sql: string; params: unknown[] } };
+      select: { [key: string]: PgColumn | undefined };
+    },
+    context?: { logger?: Logger },
+  ): Promise<Awaited<query>> => {
+    if (qb.$dialect !== "postgres") {
+      return (await qb.wrap({ label }, () => query, context)) as Awaited<query>;
+    }
+
+    const keys = Object.keys(select);
+    const decoders = keys.map((key) => {
+      const column = select[key]!;
+      return column.mapFromDriverValue === identityMapFromDriverValue
+        ? undefined
+        : column;
+    });
+    const { sql: text, params } = query.toSQL();
+
+    const result = await qb.wrap(
+      { label },
+      () =>
+        (qb.$client as pg.Pool).query<unknown[]>({
+          text,
+          values: params,
+          rowMode: "array",
+        }),
+      context,
+    );
+
+    const rows = new Array(result.rows.length);
+    for (let r = 0; r < result.rows.length; r++) {
+      const values = result.rows[r]!;
+      const row: { [key: string]: unknown } = {};
+      for (let c = 0; c < keys.length; c++) {
+        const value = values[c];
+        row[keys[c]!] =
+          value === null || decoders[c] === undefined
+            ? value
+            : decoders[c]!.mapFromDriverValue(value);
+      }
+      rows[r] = row;
+    }
+    return rows as Awaited<query>;
+  };
+
+  const insertRows = async (
+    {
+      label,
+      table,
+      rows,
+      target,
+    }: {
+      label: string;
+      table: PgTable;
+      rows: Record<string, unknown>[];
+      target: string[];
+    },
+    context?: { logger?: Logger },
+  ) => {
+    if (rows.length === 0) return;
+
+    const tableColumns = getTableColumns(table);
+    const keys = Object.keys(rows[0]!);
+    const columns = keys.map((key) => tableColumns[key]!);
+    const { schema, name } = getTableConfig(table);
+    // Note: The sync query builders use `casing: "snake_case"`.
+    const columnName = (column: PgColumn) =>
+      column.keyAsName ? toSnakeCase(column.name) : column.name;
+    const prefix = `INSERT INTO "${schema}"."${name}" (${columns
+      .map((column) => `"${columnName(column)}"`)
+      .join(", ")}) VALUES `;
+    const suffix = ` ON CONFLICT (${target
+      .map((key) => `"${columnName(tableColumns[key]!)}"`)
+      .join(", ")}) DO NOTHING`;
+
+    const batchSize = Math.floor(
+      common.options.databaseMaxQueryParameters / keys.length,
+    );
+
+    const insertBatch = async (i: number) => {
+      const batch = rows.slice(i, i + batchSize);
+      const params: unknown[] = new Array(batch.length * keys.length);
+      const tuples: string[] = new Array(batch.length);
+      let p = 0;
+      for (let r = 0; r < batch.length; r++) {
+        const row = batch[r]!;
+        let tuple = "(";
+        for (let c = 0; c < keys.length; c++) {
+          const value = row[keys[c]!];
+          params[p++] =
+            value === undefined || value === null
+              ? null
+              : columns[c]!.mapToDriverValue(value);
+          tuple += c === 0 ? `$${p}` : `, $${p}`;
+        }
+        tuples[r] = `${tuple})`;
+      }
+      const text = prefix + tuples.join(", ") + suffix;
+
+      await qb.wrap(
+        { label },
+        () => (qb.$client as pg.Pool).query(text, params),
+        context,
+      );
+    };
+
+    for (let i = 0; i < rows.length; i += batchSize) await insertBatch(i);
+  };
+
   const syncStore = {
     insertIntervals: async (
       { intervals, factoryIntervals, chainId },
@@ -562,196 +887,78 @@ export const createSyncStore = ({
       return rows[0];
     },
     insertLogs: async ({ logs, chainId }, context) => {
-      if (logs.length === 0) return;
-
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
-      const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(encodeLog({ log: logs[0]!, chainId })).length,
-      );
-
-      // As an optimization, logs that are matched by a factory do
+      // Note: As an optimization, logs that are matched by a factory do
       // not contain a checkpoint, because not corresponding block is
       // fetched (no block.timestamp). However, when a log is matched by
       // both a log filter and a factory, the checkpoint must be included
       // in the db.
-
-      for (let i = 0; i < logs.length; i += batchSize) {
-        await qb.wrap(
-          { label: "insert_logs" },
-          (db) =>
-            db
-              .insert(PONDER_SYNC.logs)
-              .values(
-                logs
-                  .slice(i, i + batchSize)
-                  .map((log) => encodeLog({ log, chainId })),
-              )
-              .onConflictDoNothing({
-                target: [
-                  PONDER_SYNC.logs.chainId,
-                  PONDER_SYNC.logs.blockNumber,
-                  PONDER_SYNC.logs.logIndex,
-                ],
-              }),
-          context,
-        );
-      }
+      await insertRows(
+        {
+          label: "insert_logs",
+          table: PONDER_SYNC.logs,
+          rows: logs.map((log) => encodeLog({ log, chainId })),
+          target: ["chainId", "blockNumber", "logIndex"],
+        },
+        context,
+      );
     },
     insertBlocks: async ({ blocks, chainId }, context) => {
-      if (blocks.length === 0) return;
-
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
-      const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(encodeBlock({ block: blocks[0]!, chainId })).length,
+      await insertRows(
+        {
+          label: "insert_blocks",
+          table: PONDER_SYNC.blocks,
+          rows: blocks.map((block) => encodeBlock({ block, chainId })),
+          target: ["chainId", "number"],
+        },
+        context,
       );
-
-      for (let i = 0; i < blocks.length; i += batchSize) {
-        await qb.wrap(
-          { label: "insert_blocks" },
-          (db) =>
-            db
-              .insert(PONDER_SYNC.blocks)
-              .values(
-                blocks
-                  .slice(i, i + batchSize)
-                  .map((block) => encodeBlock({ block, chainId })),
-              )
-              .onConflictDoNothing({
-                target: [PONDER_SYNC.blocks.chainId, PONDER_SYNC.blocks.number],
-              }),
-          context,
-        );
-      }
     },
     insertTransactions: async ({ transactions, chainId }, context) => {
-      if (transactions.length === 0) return;
-
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
-      const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(
-            encodeTransaction({
-              transaction: transactions[0]!,
-              chainId,
-            }),
-          ).length,
+      await insertRows(
+        {
+          label: "insert_transactions",
+          table: PONDER_SYNC.transactions,
+          rows: transactions.map((transaction) =>
+            encodeTransaction({ transaction, chainId }),
+          ),
+          target: ["chainId", "blockNumber", "transactionIndex"],
+        },
+        context,
       );
-
-      for (let i = 0; i < transactions.length; i += batchSize) {
-        await qb.wrap(
-          { label: "insert_transactions" },
-          (db) =>
-            db
-              .insert(PONDER_SYNC.transactions)
-              .values(
-                transactions
-                  .slice(i, i + batchSize)
-                  .map((transaction) =>
-                    encodeTransaction({ transaction, chainId }),
-                  ),
-              )
-              .onConflictDoNothing({
-                target: [
-                  PONDER_SYNC.transactions.chainId,
-                  PONDER_SYNC.transactions.blockNumber,
-                  PONDER_SYNC.transactions.transactionIndex,
-                ],
-              }),
-          context,
-        );
-      }
     },
     insertTransactionReceipts: async (
       { transactionReceipts, chainId },
       context,
     ) => {
-      if (transactionReceipts.length === 0) return;
-
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
-      const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(
-            encodeTransactionReceipt({
-              transactionReceipt: transactionReceipts[0]!,
-              chainId,
-            }),
-          ).length,
+      await insertRows(
+        {
+          label: "insert_transaction_receipts",
+          table: PONDER_SYNC.transactionReceipts,
+          rows: transactionReceipts.map((transactionReceipt) =>
+            encodeTransactionReceipt({ transactionReceipt, chainId }),
+          ),
+          target: ["chainId", "blockNumber", "transactionIndex"],
+        },
+        context,
       );
-
-      for (let i = 0; i < transactionReceipts.length; i += batchSize) {
-        await qb.wrap(
-          { label: "insert_transaction_receipts" },
-          (db) =>
-            db
-              .insert(PONDER_SYNC.transactionReceipts)
-              .values(
-                transactionReceipts
-                  .slice(i, i + batchSize)
-                  .map((transactionReceipt) =>
-                    encodeTransactionReceipt({
-                      transactionReceipt,
-                      chainId,
-                    }),
-                  ),
-              )
-              .onConflictDoNothing({
-                target: [
-                  PONDER_SYNC.transactionReceipts.chainId,
-                  PONDER_SYNC.transactionReceipts.blockNumber,
-                  PONDER_SYNC.transactionReceipts.transactionIndex,
-                ],
-              }),
-          context,
-        );
-      }
     },
     insertTraces: async ({ traces, chainId }, context) => {
-      if (traces.length === 0) return;
-
-      // Calculate `batchSize` based on how many parameters the
-      // input will have
-      const batchSize = Math.floor(
-        common.options.databaseMaxQueryParameters /
-          Object.keys(
-            encodeTrace({
-              trace: traces[0]!.trace,
-              block: traces[0]!.block,
-              transaction: traces[0]!.transaction,
-              chainId,
-            }),
-          ).length,
+      await insertRows(
+        {
+          label: "insert_traces",
+          table: PONDER_SYNC.traces,
+          rows: traces.map(({ trace, block, transaction }) =>
+            encodeTrace({ trace, block, transaction, chainId }),
+          ),
+          target: [
+            "chainId",
+            "blockNumber",
+            "transactionIndex",
+            "traceAddress",
+          ],
+        },
+        context,
       );
-
-      for (let i = 0; i < traces.length; i += batchSize) {
-        await qb.wrap(
-          { label: "insert_traces" },
-          (db) =>
-            db
-              .insert(PONDER_SYNC.traces)
-              .values(
-                traces
-                  .slice(i, i + batchSize)
-                  .map(({ trace, block, transaction }) =>
-                    encodeTrace({ trace, block, transaction, chainId }),
-                  ),
-              )
-              .onConflictDoNothing({
-                target: [
-                  PONDER_SYNC.traces.chainId,
-                  PONDER_SYNC.traces.blockNumber,
-                  PONDER_SYNC.traces.transactionIndex,
-                  PONDER_SYNC.traces.traceAddress,
-                ],
-              }),
-          context,
-        );
-      }
     },
     getEventData: async (
       { filters, fromBlock, toBlock, chainId, limit },
@@ -963,18 +1170,20 @@ export const createSyncStore = ({
         )
         .limit(limit);
 
+      const logSelect = {
+        blockNumber: PONDER_SYNC.logs.blockNumber,
+        logIndex: PONDER_SYNC.logs.logIndex,
+        transactionIndex: PONDER_SYNC.logs.transactionIndex,
+        address: PONDER_SYNC.logs.address,
+        topic0: PONDER_SYNC.logs.topic0,
+        topic1: PONDER_SYNC.logs.topic1,
+        topic2: PONDER_SYNC.logs.topic2,
+        topic3: PONDER_SYNC.logs.topic3,
+        data: PONDER_SYNC.logs.data,
+      };
+
       const logsQuery = qb.raw
-        .select({
-          blockNumber: PONDER_SYNC.logs.blockNumber,
-          logIndex: PONDER_SYNC.logs.logIndex,
-          transactionIndex: PONDER_SYNC.logs.transactionIndex,
-          address: PONDER_SYNC.logs.address,
-          topic0: PONDER_SYNC.logs.topic0,
-          topic1: PONDER_SYNC.logs.topic1,
-          topic2: PONDER_SYNC.logs.topic2,
-          topic3: PONDER_SYNC.logs.topic3,
-          data: PONDER_SYNC.logs.data,
-        })
+        .select(logSelect)
         .from(PONDER_SYNC.logs)
         .where(
           and(
@@ -990,8 +1199,6 @@ export const createSyncStore = ({
         )
         .limit(limit);
 
-      let endClock = startClock();
-
       const [
         blocksRows,
         transactionsRows,
@@ -1000,27 +1207,50 @@ export const createSyncStore = ({
         tracesRows,
       ] = await Promise.all([
         shouldQueryBlocks
-          ? qb.wrap({ label: "select_blocks" }, () => blocksQuery, context)
+          ? selectRows(
+              {
+                label: "select_blocks",
+                query: blocksQuery,
+                select: blockSelect,
+              },
+              context,
+            )
           : [],
         shouldQueryTransactions
-          ? qb.wrap(
-              { label: "select_transactions" },
-              () => transactionsQuery,
+          ? selectRows(
+              {
+                label: "select_transactions",
+                query: transactionsQuery,
+                select: transactionSelect,
+              },
               context,
             )
           : [],
         shouldQueryTransactionReceipts
-          ? qb.wrap(
-              { label: "select_transaction_receipts" },
-              () => transactionReceiptsQuery,
+          ? selectRows(
+              {
+                label: "select_transaction_receipts",
+                query: transactionReceiptsQuery,
+                select: transactionReceiptSelect,
+              },
               context,
             )
           : [],
         shouldQueryLogs
-          ? qb.wrap({ label: "select_logs" }, () => logsQuery, context)
+          ? selectRows(
+              { label: "select_logs", query: logsQuery, select: logSelect },
+              context,
+            )
           : [],
         shouldQueryTraces
-          ? qb.wrap({ label: "select_traces" }, () => tracesQuery, context)
+          ? selectRows(
+              {
+                label: "select_traces",
+                query: tracesQuery,
+                select: traceSelect,
+              },
+              context,
+            )
           : [],
       ]);
 
@@ -1044,8 +1274,6 @@ export const createSyncStore = ({
           ? Number.POSITIVE_INFINITY
           : Number(tracesRows[tracesRows.length - 1]!.blockNumber),
       );
-
-      endClock = startClock();
 
       let cursor: number;
       if (
@@ -1087,168 +1315,15 @@ export const createSyncStore = ({
         }
       }
 
-      endClock = startClock();
-
-      for (let i = 0; i < blocksRows.length; i++) {
-        if (Number(blocksRows[i]!.number) > cursor) {
-          blocksRows.length = i;
-          break;
-        }
-
-        const block = blocksRows[i]!;
-
-        if (block.miner) {
-          block.miner = toLowerCase(block.miner);
-        }
-      }
-
-      for (let i = 0; i < transactionsRows.length; i++) {
-        if (Number(transactionsRows[i]!.blockNumber) > cursor) {
-          transactionsRows.length = i;
-          break;
-        }
-
-        const transaction = transactionsRows[i]!;
-        const internalTransaction =
-          transaction as unknown as InternalTransaction;
-
-        internalTransaction.blockNumber = Number(transaction.blockNumber);
-        internalTransaction.from = toLowerCase(transaction.from);
-        if (transaction.to !== null) {
-          internalTransaction.to = toLowerCase(transaction.to);
-        }
-
-        if (transaction.type === "0x0") {
-          internalTransaction.type = "legacy";
-          internalTransaction.accessList = undefined;
-          internalTransaction.maxFeePerGas = undefined;
-          internalTransaction.maxPriorityFeePerGas = undefined;
-        } else if (transaction.type === "0x1") {
-          internalTransaction.type = "eip2930";
-          internalTransaction.accessList =
-            transaction.accessList === undefined
-              ? undefined
-              : JSON.parse(transaction.accessList!);
-          internalTransaction.maxFeePerGas = undefined;
-          internalTransaction.maxPriorityFeePerGas = undefined;
-        } else if (transaction.type === "0x2") {
-          internalTransaction.type = "eip1559";
-          internalTransaction.gasPrice = undefined;
-          internalTransaction.accessList = undefined;
-        } else if (transaction.type === "0x7e") {
-          internalTransaction.type = "deposit";
-          internalTransaction.gasPrice = undefined;
-          internalTransaction.accessList = undefined;
-        }
-      }
-
-      for (let i = 0; i < transactionReceiptsRows.length; i++) {
-        if (Number(transactionReceiptsRows[i]!.blockNumber) > cursor) {
-          transactionReceiptsRows.length = i;
-          break;
-        }
-
-        const transactionReceipt = transactionReceiptsRows[i]!;
-
-        const internalTransactionReceipt =
-          transactionReceipt as unknown as InternalTransactionReceipt;
-
-        internalTransactionReceipt.blockNumber = Number(
-          transactionReceipt.blockNumber,
-        );
-        if (transactionReceipt.contractAddress) {
-          internalTransactionReceipt.contractAddress = toLowerCase(
-            transactionReceipt.contractAddress,
-          );
-        }
-        internalTransactionReceipt.from = toLowerCase(transactionReceipt.from);
-        if (transactionReceipt.to !== null) {
-          internalTransactionReceipt.to = toLowerCase(transactionReceipt.to);
-        }
-        internalTransactionReceipt.status =
-          transactionReceipt.status === "0x1"
-            ? "success"
-            : transactionReceipt.status === "0x0"
-              ? "reverted"
-              : (transactionReceipt.status as InternalTransactionReceipt["status"]);
-        internalTransactionReceipt.type =
-          transactionReceipt.type === "0x0"
-            ? "legacy"
-            : transactionReceipt.type === "0x1"
-              ? "eip2930"
-              : transactionReceipt.type === "0x2"
-                ? "eip1559"
-                : transactionReceipt.type === "0x7e"
-                  ? "deposit"
-                  : transactionReceipt.type;
-      }
-
-      for (let i = 0; i < tracesRows.length; i++) {
-        if (Number(tracesRows[i]!.blockNumber) > cursor) {
-          tracesRows.length = i;
-          break;
-        }
-
-        const trace = tracesRows[i]!;
-        const internalTrace = trace as unknown as InternalTrace;
-
-        internalTrace.blockNumber = Number(trace.blockNumber);
-
-        internalTrace.from = toLowerCase(trace.from);
-        if (trace.to !== null) {
-          internalTrace.to = toLowerCase(trace.to);
-        }
-
-        if (trace.output === null) {
-          internalTrace.output = undefined;
-        }
-      }
-
-      for (let i = 0; i < logsRows.length; i++) {
-        if (Number(logsRows[i]!.blockNumber) > cursor) {
-          logsRows.length = i;
-          break;
-        }
-
-        const log = logsRows[i]!;
-        const internalLog = log as unknown as InternalLog;
-
-        internalLog.blockNumber = Number(log.blockNumber);
-        internalLog.address = toLowerCase(log.address);
-        internalLog.removed = false;
-        internalLog.topics = [
-          // @ts-expect-error
-          log.topic0,
-          log.topic1,
-          log.topic2,
-          log.topic3,
-        ];
-        // @ts-expect-error
-        log.topic0 = undefined;
-        // @ts-expect-error
-        log.topic1 = undefined;
-        // @ts-expect-error
-        log.topic2 = undefined;
-        // @ts-expect-error
-        log.topic3 = undefined;
-      }
-
-      common.metrics.ponder_historical_extract_duration.inc(
-        { step: "format" },
-        endClock(),
-      );
-
-      await new Promise(setImmediate);
-
-      return {
-        blocks: blocksRows as InternalBlock[],
-        logs: logsRows as InternalLog[],
-        transactions: transactionsRows as InternalTransaction[],
-        transactionReceipts:
-          transactionReceiptsRows as InternalTransactionReceipt[],
-        traces: tracesRows as InternalTrace[],
+      return formatEventData({
+        common,
+        blocksRows,
+        transactionsRows,
+        transactionReceiptsRows,
+        tracesRows,
+        logsRows,
         cursor,
-      };
+      });
     },
     insertRpcRequestResults: async ({ requests, chainId }, context) => {
       if (requests.length === 0) return;
@@ -1287,11 +1362,9 @@ export const createSyncStore = ({
       const blockNumbersByRequest: (number | undefined)[] = new Array(
         requests.length,
       );
-      const requestHashes: string[] = new Array(requests.length);
 
       for (let i = 0; i < requests.length; i++) {
-        const request = requests[i]!;
-        const blockNumber = extractBlockNumberParam(request);
+        const blockNumber = extractBlockNumberParam(requests[i]!);
 
         // Note: "latest" is not considered a block number
         if (isHex(blockNumber)) {
@@ -1299,26 +1372,41 @@ export const createSyncStore = ({
         } else {
           blockNumbersByRequest[i] = undefined;
         }
-
-        const requestHash = crypto
-          .createHash("md5")
-          .update(toLowerCase(JSON.stringify(orderObject(request))))
-          .digest("hex");
-
-        requestHashes[i] = requestHash;
       }
+
+      // Note: Hashing is only needed to match rows; the range query goes first, so a range
+      // with nothing cached (indexed for the first time) costs no hashing.
+      let hashes: string[] | undefined;
+      const getRequestHashes = () => {
+        if (hashes === undefined) {
+          hashes = requests.map((request) =>
+            crypto
+              .createHash("md5")
+              .update(toLowerCase(JSON.stringify(orderObject(request))))
+              .digest("hex"),
+          );
+        }
+        return hashes;
+      };
 
       const blockNumbers = blockNumbersByRequest.filter(
         (blockNumber): blockNumber is number => blockNumber !== undefined,
       );
 
       if (blockNumbers.length > 100) {
-        const minBlockNumber = Math.min(...blockNumbers);
-        const maxBlockNumber = Math.max(...blockNumbers);
+        let minBlockNumber = blockNumbers[0]!;
+        let maxBlockNumber = blockNumbers[0]!;
+        for (const n of blockNumbers) {
+          if (n < minBlockNumber) minBlockNumber = n;
+          if (n > maxBlockNumber) maxBlockNumber = n;
+        }
 
-        const nonBlockRequestHashes = requestHashes.filter(
-          (_, i) => blockNumbersByRequest[i] === undefined,
-        );
+        const nonBlockRequestHashes =
+          blockNumbers.length === requests.length
+            ? []
+            : getRequestHashes().filter(
+                (_, i) => blockNumbersByRequest[i] === undefined,
+              );
 
         const result = await Promise.all([
           qb.wrap(
@@ -1372,6 +1460,10 @@ export const createSyncStore = ({
               ),
         ]);
 
+        if (result[0]!.length === 0 && result[1]!.length === 0) {
+          return new Array<undefined>(requests.length);
+        }
+
         const results = new Map<string, string | undefined>();
         for (const row of result[0]!) {
           results.set(row.request_hash, row.result);
@@ -1380,8 +1472,12 @@ export const createSyncStore = ({
           results.set(row.request_hash, row.result);
         }
 
-        return requestHashes.map((requestHash) => results.get(requestHash));
+        return getRequestHashes().map((requestHash) =>
+          results.get(requestHash),
+        );
       }
+
+      const requestHashes = getRequestHashes();
 
       const result = await qb.wrap(
         { label: "select_rpc_requests" },
@@ -1533,7 +1629,7 @@ export const getFilterBlockRange = ({
   };
 };
 
-const isFilterInBlockRange = ({
+export const isFilterInBlockRange = ({
   filter,
   fromBlock,
   toBlock,

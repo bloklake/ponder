@@ -1080,6 +1080,7 @@ export function buildConfig({
         reorgWindow: chain.reorgWindow ?? DEFAULT_REORG_WINDOW,
         cacheRpcRequests: chain.cacheRpcRequests ?? true,
         ethGetLogsBlockRange: chain.ethGetLogsBlockRange,
+        datalake: chain.datalake,
         viemChain: matchedChain,
       } satisfies Chain;
     },

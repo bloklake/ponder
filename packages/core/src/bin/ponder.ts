@@ -5,13 +5,6 @@ import { fileURLToPath } from "node:url";
 import { Command } from "@commander-js/extra-typings";
 import dotenv from "dotenv";
 import type { Prettify } from "@/types/utils.js";
-import { codegen } from "./commands/codegen.js";
-import { createViews } from "./commands/createViews.js";
-import { dev } from "./commands/dev.js";
-import { list } from "./commands/list.js";
-import { prune } from "./commands/prune.js";
-import { serve } from "./commands/serve.js";
-import { start } from "./commands/start.js";
 
 dotenv.config({ path: ".env.local" });
 
@@ -82,6 +75,8 @@ const devCommand = new Command("dev")
       command: command.name(),
       version: packageJson.version,
     } as GlobalOptions & ReturnType<typeof command.opts>;
+    // Note: Each command loads its modules only when it runs.
+    const { dev } = await import("./commands/dev.js");
     await dev({ cliOptions });
   });
 
@@ -105,6 +100,8 @@ const startCommand = new Command("start")
       command: command.name(),
       version: packageJson.version,
     } as GlobalOptions & ReturnType<typeof command.opts>;
+    // Note: Each command loads its modules only when it runs.
+    const { start } = await import("./commands/start.js");
     await start({ cliOptions });
   });
 
@@ -123,6 +120,8 @@ const serveCommand = new Command("serve")
       command: command.name(),
       version: packageJson.version,
     } as GlobalOptions & ReturnType<typeof command.opts>;
+    // Note: Each command loads its modules only when it runs.
+    const { serve } = await import("./commands/serve.js");
     await serve({ cliOptions });
   });
 
@@ -141,6 +140,8 @@ const createViewsCommand = new Command("create-views")
       command: command.name(),
       version: packageJson.version,
     } as GlobalOptions & ReturnType<typeof command.opts>;
+    // Note: Each command loads its modules only when it runs.
+    const { createViews } = await import("./commands/createViews.js");
     await createViews({ cliOptions });
   });
 
@@ -155,6 +156,8 @@ const listCommand = new Command("list")
       command: command.name(),
       version: packageJson.version,
     } as GlobalOptions & ReturnType<typeof command.opts>;
+    // Note: Each command loads its modules only when it runs.
+    const { list } = await import("./commands/list.js");
     await list({ cliOptions });
   });
 
@@ -169,6 +172,8 @@ const pruneCommand = new Command("prune")
       command: command.name(),
       version: packageJson.version,
     } as GlobalOptions & ReturnType<typeof command.opts>;
+    // Note: Each command loads its modules only when it runs.
+    const { prune } = await import("./commands/prune.js");
     await prune({ cliOptions });
   });
 
@@ -181,6 +186,8 @@ const codegenCommand = new Command("codegen")
       command: command.name(),
       version: packageJson.version,
     } as GlobalOptions & ReturnType<typeof command.opts>;
+    // Note: Each command loads its modules only when it runs.
+    const { codegen } = await import("./commands/codegen.js");
     await codegen({ cliOptions });
   });
 

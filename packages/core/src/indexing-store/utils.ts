@@ -1,6 +1,6 @@
 import {
   and,
-  type Column,
+  Column,
   eq,
   getTableColumns,
   getTableName,
@@ -67,6 +67,8 @@ export const getPrimaryKeyCache = (tables: Table[]) => {
   return cache;
 };
 
+const identityMapFromDriverValue = (Column.prototype as any).mapFromDriverValue;
+
 export const normalizeColumn = (
   column: Column,
   value: unknown,
@@ -96,7 +98,16 @@ export const normalizeColumn = (
       return value;
     }
 
-    return column.mapFromDriverValue(column.mapToDriverValue(value));
+    // Note: `BigInt(value)` of a bigint is the identity, so skip the round trip.
+    if (column.columnType === "PgEvmBigint" && typeof value === "bigint") {
+      return value;
+    }
+
+    const driverValue = column.mapToDriverValue(value);
+    if (column.mapFromDriverValue === identityMapFromDriverValue) {
+      return driverValue;
+    }
+    return column.mapFromDriverValue(driverValue);
   } catch (e) {
     if (
       (e as Error)?.message?.includes("Do not know how to serialize a BigInt")

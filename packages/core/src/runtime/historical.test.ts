@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
 import { hexToBigInt } from "viem";
 import { beforeEach, expect, test, vi } from "vitest";
+import { withMetadata } from "@/_test/datalake.js";
 import {
   context,
   setupAnvil,
@@ -280,6 +282,92 @@ test("getLocalInMemoryEventGenerator()", async () => {
     [0, 0],
     [1, 1],
   ]);
+});
+
+test("getLocalInMemoryEventGenerator() reads blocks up to the datalake archive height from the datalake", async () => {
+  const { syncStore } = await setupDatabaseServices();
+  const chain: Chain = {
+    ...getChain({ cacheRpcRequests: false }),
+    datalake: { url: `http://datalake-${crypto.randomUUID()}.test` },
+  };
+  const rpc = createRpc({ chain, common: context.common });
+
+  const { eventCallbacks } = getBlocksIndexingBuild({
+    interval: 1,
+  });
+
+  await testClient.mine({ blocks: 2 });
+
+  // Note: The datalake holds blocks 0 and 1 and answers with pages without rows; block 2
+  // comes from JSON-RPC. Other requests (anvil) pass through.
+  const emptyPage = readFileSync(
+    new URL("../sync-datalake/_test/empty.arrow", import.meta.url),
+  );
+  const datalakeQueries: { fromBlock: number; toBlock: number }[] = [];
+  const realFetch = globalThis.fetch;
+  const fetchSpy = vi
+    .spyOn(globalThis, "fetch")
+    .mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith(chain.datalake!.url) === false) {
+        return realFetch(input, init);
+      }
+      if (url.endsWith("/status")) {
+        return Response.json({ chain_id: chain.id, archive_height: 1 });
+      }
+      const query = JSON.parse(String(init!.body));
+      datalakeQueries.push({
+        fromBlock: query.fromBlock,
+        toBlock: query.toBlock,
+      });
+      return new Response(
+        new Uint8Array(
+          withMetadata(emptyPage, {
+            "bl.next_block": String(query.toBlock + 1),
+          }),
+        ),
+      );
+    });
+
+  try {
+    const cachedIntervals = await getCachedIntervals({
+      common: context.common,
+      chain,
+      syncStore,
+      filters: eventCallbacks.map(({ filter }) => filter),
+    });
+
+    const syncProgress = await getLocalSyncProgress({
+      common: context.common,
+      filters: eventCallbacks.map(({ filter }) => filter),
+      chain,
+      rpc,
+      finalizedBlock: await eth_getBlockByNumber(rpc, ["0x2", true]),
+      cachedIntervals,
+    });
+
+    const eventGenerator = getLocalInMemoryEventGenerator({
+      common: context.common,
+      chain,
+      rpc,
+      eventCallbacks,
+      childAddresses: new Map(),
+      syncProgress,
+      cachedIntervals,
+      from: syncProgress.getCheckpoint({ tag: "start" })!,
+      to: syncProgress.getCheckpoint({ tag: "finalized" })!,
+      limit: 100,
+      isCatchup: false,
+    });
+
+    const events = await drainAsyncGenerator(eventGenerator);
+    expect(datalakeQueries).toStrictEqual([{ fromBlock: 0, toBlock: 1 }]);
+    // Note: Only block 2 has an event; the datalake pages had no rows.
+    expect(events.flatMap(({ events }) => events)).toHaveLength(1);
+    expect(events.map(({ blockRange }) => blockRange)).toStrictEqual([[2, 2]]);
+  } finally {
+    fetchSpy.mockRestore();
+  }
 });
 
 test("getLocalInMemoryEventGenerator() with start block after finalized block", async () => {

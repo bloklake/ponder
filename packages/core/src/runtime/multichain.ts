@@ -34,6 +34,7 @@ import { getAppProgress } from "@/internal/metrics.js";
 import type {
   Chain,
   CrashRecoveryCheckpoint,
+  Event,
   IndexingBuild,
   IndexingErrorHandler,
   NamespaceBuild,
@@ -52,6 +53,7 @@ import {
 import { formatEta, formatPercentage } from "@/utils/format.js";
 import {
   bufferAsyncGenerator,
+  lookaheadAsyncGenerator,
   recordAsyncGenerator,
 } from "@/utils/generators.js";
 import { never } from "@/utils/never.js";
@@ -68,6 +70,7 @@ import {
   getLocalSyncProgress,
   type SyncProgress,
 } from "./index.js";
+import { createCommitPipeline, indexBatchPipelined } from "./pipeline.js";
 import { getRealtimeEventsMultichain } from "./realtime.js";
 
 export async function runMultichain({
@@ -162,6 +165,7 @@ export async function runMultichain({
         indexingBuild.eventCallbacks[indexingBuild.chains.indexOf(chain)]!;
 
       const cachedIntervals = await getCachedIntervals({
+        common,
         chain,
         filters: eventCallbacks.map(({ filter }) => filter),
         syncStore,
@@ -176,6 +180,7 @@ export async function runMultichain({
         cachedIntervals,
       });
       const childAddresses = await getChildAddresses({
+        common,
         chain,
         filters: eventCallbacks.map(({ filter }) => filter),
         syncStore,
@@ -318,6 +323,27 @@ export async function runMultichain({
 
   const backfillEndClock = startClock();
 
+  const updateIndexingSeconds = (event: Event, chain: Chain) => {
+    const checkpoint = decodeCheckpoint(event!.checkpoint);
+
+    common.metrics.ponder_historical_completed_indexing_seconds.set(
+      { chain: chain.name },
+      Math.max(
+        Number(checkpoint.blockTimestamp) -
+          Math.max(seconds[chain.name]!.cached, seconds[chain.name]!.start),
+        0,
+      ),
+    );
+    common.metrics.ponder_indexing_timestamp.set(
+      { chain: chain.name },
+      Number(checkpoint.blockTimestamp),
+    );
+  };
+
+  // Note: See `indexBatchPipelined`. Batches fall back to the sequential path
+  // below whenever pipelining does not apply.
+  const commitPipeline = createCommitPipeline();
+
   // Run historical indexing until complete.
   for await (let {
     events,
@@ -325,13 +351,21 @@ export async function runMultichain({
     checkpoint,
     blockRange,
   } of recordAsyncGenerator(
-    getHistoricalEventsMultichain({
-      common,
-      indexingBuild,
-      crashRecoveryCheckpoint,
-      perChainSync,
-      database,
-    }),
+    // Note: The next batch is produced while the current one is indexed, and its contract
+    // reads are prefetched as soon as it is ready, so they are in flight (or done) when its
+    // indexing starts. They are kept through the current batch's cache clear.
+    lookaheadAsyncGenerator(
+      getHistoricalEventsMultichain({
+        common,
+        indexingBuild,
+        crashRecoveryCheckpoint,
+        perChainSync,
+        database,
+      }),
+      ({ events }) => {
+        cachedViemClient.prefetch({ events, keep: true }).catch(() => {});
+      },
+    ),
     (params) => {
       common.metrics.ponder_historical_concurrency_group_duration.inc(
         { group: "extract" },
@@ -349,6 +383,51 @@ export async function runMultichain({
     const indexStartClock = startClock();
 
     const chain = indexingBuild.chains.find((chain) => chain.id === chainId)!;
+
+    const isPipelined = await indexBatchPipelined({
+      common,
+      database,
+      indexing,
+      indexingStore,
+      indexingCache,
+      cachedViemClient,
+      commitPipeline,
+      events,
+      updateIndexingSeconds,
+      writeCheckpoint: (tx) =>
+        tx.wrap(
+          { label: "update_checkpoints" },
+          (tx) =>
+            tx
+              .insert(PONDER_CHECKPOINT)
+              .values({
+                chainName: chain.name,
+                chainId,
+                latestCheckpoint: checkpoint,
+                finalizedCheckpoint: checkpoint,
+                safeCheckpoint: checkpoint,
+              })
+              .onConflictDoUpdate({
+                target: PONDER_CHECKPOINT.chainName,
+                set: {
+                  safeCheckpoint: sql`excluded.safe_checkpoint`,
+                  finalizedCheckpoint: sql`excluded.finalized_checkpoint`,
+                  latestCheckpoint: sql`excluded.latest_checkpoint`,
+                },
+              }),
+          context,
+        ),
+      onCommitted: () =>
+        common.logger.info({
+          msg: "Indexed block range",
+          chain: chain.name,
+          chain_id: chain.id,
+          event_count: events.length,
+          block_range: JSON.stringify(blockRange),
+          duration: indexStartClock(),
+        }),
+    });
+    if (isPipelined) continue;
 
     indexingCache.qb = database.userQB;
     await Promise.all([
@@ -381,25 +460,7 @@ export async function runMultichain({
 
           await indexing.processHistoricalEvents({
             events,
-            updateIndexingSeconds(event, chain) {
-              const checkpoint = decodeCheckpoint(event!.checkpoint);
-
-              common.metrics.ponder_historical_completed_indexing_seconds.set(
-                { chain: chain.name },
-                Math.max(
-                  Number(checkpoint.blockTimestamp) -
-                    Math.max(
-                      seconds[chain.name]!.cached,
-                      seconds[chain.name]!.start,
-                    ),
-                  0,
-                ),
-              );
-              common.metrics.ponder_indexing_timestamp.set(
-                { chain: chain.name },
-                Number(checkpoint.blockTimestamp),
-              );
-            },
+            updateIndexingSeconds,
           });
 
           indexingStore.isProcessingEvents = false;
@@ -513,6 +574,8 @@ export async function runMultichain({
       duration: indexStartClock(),
     });
   }
+
+  await commitPipeline.drain();
 
   indexingCache.clear();
   // Note: Invalidating the cache means that only predicted rows will be in memory after this point.

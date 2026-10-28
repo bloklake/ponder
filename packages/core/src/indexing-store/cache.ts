@@ -70,7 +70,26 @@ export type IndexingCache = {
    *
    * @param params.tableNames - If provided, only flush the tables in the set.
    */
-  flush: (params?: { tableNames?: Set<string> }) => Promise<void>;
+  flush: (params?: {
+    tableNames?: Set<string>;
+    /** Flush a detached snapshot instead of the live buffers. */
+    snapshot?: BufferSnapshot;
+    /** Query builder to flush with, defaults to `qb`. */
+    qb?: QB;
+  }) => Promise<void>;
+  /**
+   * Move the live insert and update buffers into a snapshot that can be flushed
+   * while the next batch writes to fresh buffers. Reads see live buffers first,
+   * then snapshots (newest first), then the cache.
+   */
+  detach: () => BufferSnapshot;
+  /** Forget a snapshot once its transaction has committed. */
+  release: (snapshot: BufferSnapshot) => void;
+  /**
+   * `true` if every table is fully cached and within the memory limit, so that
+   * processing a batch never reads from the database.
+   */
+  isComplete: () => boolean;
   /**
    * Predict and load rows that will be accessed in the next event batch.
    */
@@ -188,6 +207,10 @@ type Buffer = Map<
     }
   >
 >;
+/**
+ * Detached buffers of one batch, waiting to be flushed.
+ */
+export type BufferSnapshot = { insertBuffer: Buffer; updateBuffer: Buffer };
 /**
  * Metadata about database access patterns for each event.
  */
@@ -358,11 +381,13 @@ export const createIndexingCache = ({
   chainId?: number;
 }): IndexingCache => {
   let event: Event | undefined;
-  let qb: QB = undefined!;
+  let _qb: QB = undefined!;
 
   const cache: Cache = new Map();
-  const insertBuffer: Buffer = new Map();
-  const updateBuffer: Buffer = new Map();
+  const liveInsertBuffer: Buffer = new Map();
+  const liveUpdateBuffer: Buffer = new Map();
+  /** Detached buffers that are not committed yet, newest first. */
+  let snapshots: BufferSnapshot[] = [];
   /** Profiling data about access patterns for each event. */
   const profile: Profile = new Map();
 
@@ -378,8 +403,8 @@ export const createIndexingCache = ({
       bytes: 0,
       diskReads: 0,
     });
-    insertBuffer.set(table, new Map());
-    updateBuffer.set(table, new Map());
+    liveInsertBuffer.set(table, new Map());
+    liveUpdateBuffer.set(table, new Map());
   }
 
   return {
@@ -388,9 +413,14 @@ export const createIndexingCache = ({
       const ck = getCacheKey(table, key, primaryKeyCache);
 
       return (
-        cache.get(table)!.cache.has(ck) ??
-        insertBuffer.get(table)!.has(ck) ??
-        updateBuffer.get(table)!.has(ck)
+        cache.get(table)!.cache.has(ck) ||
+        liveInsertBuffer.get(table)!.has(ck) ||
+        liveUpdateBuffer.get(table)!.has(ck) ||
+        snapshots.some(
+          (snapshot) =>
+            snapshot.insertBuffer.get(table)!.has(ck) ||
+            snapshot.updateBuffer.get(table)!.has(ck),
+        )
       );
     },
     async get({ table, key }) {
@@ -431,8 +461,14 @@ export const createIndexingCache = ({
       const ck = getCacheKey(table, key, primaryKeyCache);
       // Note: order is important, it is an invariant that update entries
       // are prioritized over insert entries
-      const bufferEntry =
-        updateBuffer.get(table)!.get(ck) ?? insertBuffer.get(table)!.get(ck);
+      let bufferEntry =
+        liveUpdateBuffer.get(table)!.get(ck) ??
+        liveInsertBuffer.get(table)!.get(ck);
+      for (let i = 0; bufferEntry === undefined && i < snapshots.length; i++) {
+        bufferEntry =
+          snapshots[i]!.updateBuffer.get(table)!.get(ck) ??
+          snapshots[i]!.insertBuffer.get(table)!.get(ck);
+      }
 
       if (bufferEntry) {
         common.metrics.incrementIndexingCacheRequests(
@@ -478,7 +514,7 @@ export const createIndexingCache = ({
 
       const endClock = startClock();
 
-      const result = await qb
+      const result = await _qb
         .wrap((db) =>
           db.select().from(table).where(getWhereCondition(table, key)),
         )
@@ -506,9 +542,9 @@ export const createIndexingCache = ({
       const ck = getCacheKey(table, key, primaryKeyCache);
 
       if (isUpdate) {
-        updateBuffer.get(table)!.set(ck, { row, metadata: { event } });
+        liveUpdateBuffer.get(table)!.set(ck, { row, metadata: { event } });
       } else {
-        insertBuffer.get(table)!.set(ck, { row, metadata: { event } });
+        liveInsertBuffer.get(table)!.set(ck, { row, metadata: { event } });
       }
 
       return row;
@@ -516,12 +552,12 @@ export const createIndexingCache = ({
     async delete({ table, key }) {
       const ck = getCacheKey(table, key, primaryKeyCache);
 
-      const inInsertBuffer = insertBuffer.get(table)!.delete(ck);
-      const inUpdateBuffer = updateBuffer.get(table)!.delete(ck);
+      const inInsertBuffer = liveInsertBuffer.get(table)!.delete(ck);
+      const inUpdateBuffer = liveUpdateBuffer.get(table)!.delete(ck);
 
       cache.get(table)!.cache.delete(ck);
 
-      const inDb = await qb
+      const inDb = await _qb
         .wrap((db) =>
           db.delete(table).where(getWhereCondition(table, key)).returning(),
         )
@@ -529,7 +565,15 @@ export const createIndexingCache = ({
 
       return inInsertBuffer || inUpdateBuffer || inDb;
     },
-    async flush({ tableNames } = {}) {
+    async flush({ tableNames, snapshot, qb: flushQB } = {}) {
+      // Note: Capture the buffers and query builder, a pipelined flush runs while
+      // the next batch uses the live ones.
+      const qb = flushQB ?? _qb;
+      const insertBuffer = snapshot?.insertBuffer ?? liveInsertBuffer;
+      const updateBuffer = snapshot?.updateBuffer ?? liveUpdateBuffer;
+      // Note: A snapshot is kept intact until it is released after commit, so a
+      // retried transaction flushes the same rows again.
+      const shouldClear = snapshot === undefined;
       const context = {
         logger: common.logger.child({ action: "flush_database_rows" }),
       };
@@ -592,7 +636,7 @@ export const createIndexingCache = ({
             tableCache.cache.set(key, entry.row);
           }
           tableCache.bytes += bytes;
-          insertBuffer.get(table)!.clear();
+          if (shouldClear) insertBuffer.get(table)!.clear();
 
           await new Promise(setImmediate);
         }
@@ -683,7 +727,7 @@ export const createIndexingCache = ({
             tableCache.cache.set(key, entry.row);
           }
           tableCache.bytes += bytes;
-          updateBuffer.get(table)!.clear();
+          if (shouldClear) updateBuffer.get(table)!.clear();
 
           await new Promise(setImmediate);
         }
@@ -874,6 +918,32 @@ export const createIndexingCache = ({
         throw error;
       }
     },
+    detach() {
+      const snapshot: BufferSnapshot = {
+        insertBuffer: new Map(),
+        updateBuffer: new Map(),
+      };
+      for (const table of tables) {
+        snapshot.insertBuffer.set(table, liveInsertBuffer.get(table)!);
+        snapshot.updateBuffer.set(table, liveUpdateBuffer.get(table)!);
+        liveInsertBuffer.set(table, new Map());
+        liveUpdateBuffer.set(table, new Map());
+      }
+      snapshots = [snapshot, ...snapshots];
+      return snapshot;
+    },
+    release(snapshot) {
+      snapshots = snapshots.filter((s) => s !== snapshot);
+    },
+    isComplete() {
+      let totalBytes = 0;
+      for (const table of tables) {
+        const tableCache = cache.get(table)!;
+        if (tableCache.isCacheComplete === false) return false;
+        totalBytes += tableCache.bytes;
+      }
+      return totalBytes <= common.options.indexingCacheMaxBytes;
+    },
     async prefetch({ events }) {
       const context = {
         logger: common.logger.child({ action: "prefetch_database_rows" }),
@@ -987,7 +1057,7 @@ export const createIndexingCache = ({
             if (conditions.length === 0) return;
             const endClock = startClock();
 
-            await qb
+            await _qb
               .wrap(
                 (db) =>
                   db
@@ -1041,19 +1111,19 @@ export const createIndexingCache = ({
         tableCache.spillover.clear();
       }
 
-      for (const tableBuffer of insertBuffer.values()) {
+      for (const tableBuffer of liveInsertBuffer.values()) {
         tableBuffer.clear();
       }
 
-      for (const tableBuffer of updateBuffer.values()) {
+      for (const tableBuffer of liveUpdateBuffer.values()) {
         tableBuffer.clear();
       }
     },
     set event(_event: Event | undefined) {
       event = _event;
     },
-    set qb(_qb: QB) {
-      qb = _qb;
+    set qb(qb: QB) {
+      _qb = qb;
     },
   };
 };

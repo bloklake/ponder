@@ -23,6 +23,10 @@ import {
   recoverFactory,
   recoverFilter,
 } from "@/runtime/fragments.js";
+import {
+  getDatalake,
+  getDatalakeChildAddresses,
+} from "@/sync-datalake/index.js";
 import type { SyncStore } from "@/sync-store/index.js";
 import {
   blockToCheckpoint,
@@ -38,6 +42,7 @@ import {
   intervalUnion,
   sortIntervals,
 } from "@/utils/interval.js";
+import { startClock } from "@/utils/timer.js";
 
 export type SyncProgress = {
   start: SyncBlock | LightBlock;
@@ -180,6 +185,8 @@ export async function getLocalSyncProgress(params: {
 
 export async function getChildAddresses(params: {
   chain: Chain;
+  /** Required for chains with a datalake. */
+  common?: Common;
   filters: Filter[];
   syncStore: SyncStore;
 }): Promise<ChildAddresses> {
@@ -222,10 +229,65 @@ export async function getChildAddresses(params: {
         break;
     }
   }
+  // Note: Children created up to the chain's datalake archive height are discovered from
+  // the datalake before any sync starts: those blocks are never synced into `ponder_sync`,
+  // and a child created there can still emit events above it (synced from JSON-RPC).
+  if (params.common !== undefined) {
+    const datalake = await getDatalake({
+      common: params.common,
+      chain: params.chain,
+      filters: params.filters,
+    });
+    if (datalake !== undefined) {
+      const discoveredFactories = new Set<string>();
+      for (const filter of params.filters) {
+        if (
+          filter.type !== "log" ||
+          isAddressFactory(filter.address) === false
+        ) {
+          continue;
+        }
+        const factory = filter.address;
+        // Note: Several filters (one per event) share a factory.
+        if (discoveredFactories.has(factory.id)) continue;
+        discoveredFactories.add(factory.id);
+        const endClock = startClock();
+        const discovered = await getDatalakeChildAddresses({
+          datalake,
+          factory,
+          toBlock: datalake.archiveHeight,
+        });
+        if (childAddresses.has(factory.id) === false) {
+          childAddresses.set(factory.id, new Map());
+        }
+        const known = childAddresses.get(factory.id)!;
+        for (const [address, blockNumber] of discovered) {
+          const previous = known.get(address);
+          if (previous === undefined || blockNumber < previous) {
+            known.set(address, blockNumber);
+          }
+        }
+        params.common.metrics.ponder_datalake_request_duration.observe(
+          { chain: params.chain.name, kind: "children" },
+          endClock(),
+        );
+        params.common.logger.info({
+          msg: "Discovered factory children from the datalake",
+          chain: params.chain.name,
+          chain_id: params.chain.id,
+          factory: factory.id,
+          count: discovered.size,
+        });
+      }
+    }
+  }
+
   return childAddresses;
 }
 
 export async function getCachedIntervals(params: {
+  /** Required for chains with a datalake (logging). */
+  common?: Common;
   chain: Chain;
   filters: Filter[];
   syncStore: SyncStore;
@@ -254,6 +316,24 @@ export async function getCachedIntervals(params: {
     cachedIntervals = await params.syncStore.getIntervals({
       filters: params.filters,
     });
+  }
+
+  // Note: Blocks the chain's datalake holds are read from it by the event generator, so
+  // they count as cached. This is in memory only: nothing is written to `ponder_sync`, and
+  // without the datalake config the JSON-RPC sync fetches these blocks as usual.
+  const datalake =
+    params.common === undefined
+      ? undefined
+      : await getDatalake({ ...params, common: params.common });
+  if (datalake !== undefined) {
+    for (const entries of cachedIntervals.values()) {
+      for (const entry of entries) {
+        entry.intervals = intervalUnion([
+          ...entry.intervals,
+          [0, datalake.archiveHeight],
+        ]);
+      }
+    }
   }
 
   return cachedIntervals;

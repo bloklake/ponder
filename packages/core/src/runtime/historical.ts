@@ -7,6 +7,7 @@ import type {
   CrashRecoveryCheckpoint,
   Event,
   EventCallback,
+  Filter,
   IndexingBuild,
   RawEvent,
   SyncBlock,
@@ -14,6 +15,7 @@ import type {
 import { eth_getBlockByNumber } from "@/rpc/actions.js";
 import type { Rpc } from "@/rpc/index.js";
 import { buildEvents, decodeEvents } from "@/runtime/events.js";
+import { getDatalake, getDatalakeEventData } from "@/sync-datalake/index.js";
 import { createInMemoryHistoricalSync } from "@/sync-historical/in-memory.js";
 import { createHistoricalSync } from "@/sync-historical/index.js";
 import { createSyncStore, type SyncStore } from "@/sync-store/index.js";
@@ -924,6 +926,14 @@ export async function refetchLocalEvents(params: {
   const toBlock = Number(decodeCheckpoint(to).blockNumber);
   let cursor = fromBlock;
 
+  const getEventData = await createEventDataReader({
+    common: params.common,
+    chain: params.chain,
+    filters: params.eventCallbacks.map(({ filter }) => filter),
+    childAddresses: params.childAddresses,
+    syncStore: params.syncStore,
+  });
+
   let events: RawEvent[] | undefined;
   while (cursor <= toBlock) {
     const queryEndClock = startClock();
@@ -935,7 +945,7 @@ export async function refetchLocalEvents(params: {
       transactionReceipts,
       traces,
       cursor: queryCursor,
-    } = await params.syncStore.getEventData({
+    } = await getEventData({
       filters: params.eventCallbacks.map(({ filter }) => filter),
       fromBlock: cursor,
       toBlock,
@@ -1019,6 +1029,14 @@ export async function* getLocalEventGenerator(params: {
   const toBlock = Number(decodeCheckpoint(params.to).blockNumber);
   let cursor = fromBlock;
 
+  const getEventData = await createEventDataReader({
+    common: params.common,
+    chain: params.chain,
+    filters: params.eventCallbacks.map(({ filter }) => filter),
+    childAddresses: params.childAddresses,
+    syncStore,
+  });
+
   const localSyncGenerator = getLocalSyncGenerator(params);
 
   for await (const syncCursor of bufferAsyncGenerator(
@@ -1035,7 +1053,7 @@ export async function* getLocalEventGenerator(params: {
         transactionReceipts,
         traces,
         cursor: queryCursor,
-      } = await syncStore.getEventData({
+      } = await getEventData({
         filters: params.eventCallbacks.map(({ filter }) => filter),
         fromBlock: cursor,
         toBlock: Math.min(syncCursor, toBlock),
@@ -1225,6 +1243,72 @@ export async function* getLocalInMemoryEventGenerator(params: {
     Math.max(0, Math.min(fromBlock, hexToNumber(last.number) + 1) - first),
   );
   let cursor = fromBlock;
+
+  // Note: Blocks the chain's datalake holds count as cached (see `getCachedIntervals`), so
+  // the in-memory sync skips them; their events are read from the datalake first.
+  const filters = params.eventCallbacks.map(({ filter }) => filter);
+  const datalake = await getDatalake({
+    common: params.common,
+    chain: params.chain,
+    filters,
+  });
+  const datalakeEnd =
+    datalake === undefined
+      ? cursor - 1
+      : Math.min(datalake.archiveHeight, hexToNumber(last.number));
+  while (datalake !== undefined && cursor <= datalakeEnd) {
+    const {
+      blocks,
+      logs,
+      transactions,
+      transactionReceipts,
+      traces,
+      cursor: queryCursor,
+    } = await getDatalakeEventData({
+      common: params.common,
+      datalake,
+      childAddresses: params.childAddresses,
+      filters,
+      fromBlock: cursor,
+      toBlock: datalakeEnd,
+      chainId: params.chain.id,
+      limit: params.limit,
+    });
+
+    const endClock = startClock();
+    const rawEvents = buildEvents({
+      eventCallbacks: params.eventCallbacks,
+      blocks,
+      logs,
+      transactions,
+      transactionReceipts,
+      traces,
+      childAddresses: params.childAddresses,
+      chainId: params.chain.id,
+    });
+    params.common.metrics.ponder_historical_extract_duration.inc(
+      { step: "build" },
+      endClock(),
+    );
+    params.common.metrics.ponder_historical_completed_blocks.inc(
+      label,
+      queryCursor - cursor + 1,
+    );
+
+    const blockRange = [cursor, queryCursor] satisfies [number, number];
+    cursor = queryCursor + 1;
+
+    if (blocks.length > 0) {
+      const lastBlock = blocks[blocks.length - 1]!;
+      const checkpoint = encodeCheckpoint({
+        ...MAX_CHECKPOINT,
+        blockTimestamp: lastBlock.timestamp,
+        chainId: BigInt(params.chain.id),
+        blockNumber: lastBlock.number,
+      });
+      yield { events: rawEvents, checkpoint, blockRange };
+    }
+  }
 
   for await (const blockData of historicalSync.syncBlockData({
     requiredIntervals,
@@ -1729,4 +1813,59 @@ export async function* mergeAsyncGeneratorsWithEventOrder(
     }
     results[index] = await resultPromise;
   }
+}
+
+/**
+ * `syncStore.getEventData`, reading blocks up to the chain's datalake archive height from the
+ * datalake (those blocks are never synced into `ponder_sync`, see `getCachedIntervals`).
+ */
+async function createEventDataReader(params: {
+  common: Common;
+  chain: Chain;
+  filters: Filter[];
+  childAddresses: ChildAddresses;
+  syncStore: SyncStore;
+}): Promise<SyncStore["getEventData"]> {
+  const datalake = await getDatalake(params);
+  if (datalake === undefined) return params.syncStore.getEventData;
+
+  type Args = Parameters<SyncStore["getEventData"]>[0];
+  type Result = ReturnType<SyncStore["getEventData"]>;
+  const fetch = (args: Args): Result =>
+    getDatalakeEventData({
+      common: params.common,
+      datalake,
+      childAddresses: params.childAddresses,
+      ...args,
+      toBlock: Math.min(args.toBlock, datalake.archiveHeight),
+    });
+  const key = (args: Args) =>
+    `${args.fromBlock}_${args.toBlock}_${args.limit}_${args.filters.length}`;
+
+  // Note: Read one call ahead — the event generator asks for `[cursor + 1, toBlock]` next,
+  // so that request is started while the current events are indexed.
+  let ahead: { key: string; result: Result } | undefined;
+
+  return (args, context) => {
+    if (args.fromBlock > datalake.archiveHeight) {
+      return params.syncStore.getEventData(args, context);
+    }
+    const result =
+      ahead !== undefined && ahead.key === key(args)
+        ? ahead.result
+        : fetch(args);
+    ahead = undefined;
+    result
+      .then(({ cursor }) => {
+        const next = { ...args, fromBlock: cursor + 1 };
+        if (next.fromBlock <= Math.min(args.toBlock, datalake.archiveHeight)) {
+          const promise = fetch(next);
+          // Note: An unused read-ahead must not surface as an unhandled rejection.
+          promise.catch(() => {});
+          ahead = { key: key(next), result: promise };
+        }
+      })
+      .catch(() => {});
+    return result;
+  };
 }

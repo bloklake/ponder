@@ -650,11 +650,14 @@ test("prefetch() without rpc request cache", async () => {
   expect(totalSupply).toBe(parseEther("1"));
 
   event.event.block.number = 2n;
-  cachedViemClient.event = event;
 
   await cachedViemClient.prefetch({
     events: [event],
   });
+
+  // Note: As in the runtime, the event is set once it is indexed, after the prefetch of
+  // its batch; the prediction counts the events set so far.
+  cachedViemClient.event = event;
 
   const requestSpy = vi.spyOn(rpc, "request");
 

@@ -25,7 +25,9 @@ import {
   type RetryableError,
 } from "@/internal/errors.js";
 import type {
+  Chain,
   CrashRecoveryCheckpoint,
+  Event,
   IndexingBuild,
   IndexingErrorHandler,
   NamespaceBuild,
@@ -56,6 +58,7 @@ import {
   getChildAddresses,
   getLocalSyncProgress,
 } from "./index.js";
+import { createCommitPipeline, indexBatchPipelined } from "./pipeline.js";
 import { getRealtimeEventsIsolated } from "./realtime.js";
 
 export async function runIsolated({
@@ -141,6 +144,7 @@ export async function runIsolated({
     indexingBuild.eventCallbacks[indexingBuild.chains.indexOf(chain)]!;
 
   const cachedIntervals = await getCachedIntervals({
+    common,
     chain,
     filters: eventCallbacks.map(({ filter }) => filter),
     syncStore,
@@ -154,6 +158,7 @@ export async function runIsolated({
     cachedIntervals,
   });
   const childAddresses = await getChildAddresses({
+    common,
     chain,
     filters: eventCallbacks.map(({ filter }) => filter),
     syncStore,
@@ -259,6 +264,27 @@ export async function runIsolated({
 
   const backfillEndClock = startClock();
 
+  const updateIndexingSeconds = (event: Event, chain: Chain) => {
+    const checkpoint = decodeCheckpoint(event!.checkpoint);
+
+    common.metrics.ponder_historical_completed_indexing_seconds.set(
+      { chain: chain.name },
+      Math.max(
+        Number(checkpoint.blockTimestamp) -
+          Math.max(seconds[chain.name]!.cached, seconds[chain.name]!.start),
+        0,
+      ),
+    );
+    common.metrics.ponder_indexing_timestamp.set(
+      { chain: chain.name },
+      Number(checkpoint.blockTimestamp),
+    );
+  };
+
+  // Note: See `indexBatchPipelined`. Batches fall back to the sequential path
+  // below whenever pipelining does not apply.
+  const commitPipeline = createCommitPipeline();
+
   // Run historical indexing until complete.
   for await (let {
     events,
@@ -295,6 +321,51 @@ export async function runIsolated({
     };
     const indexStartClock = startClock();
 
+    const isPipelined = await indexBatchPipelined({
+      common,
+      database,
+      indexing,
+      indexingStore,
+      indexingCache,
+      cachedViemClient,
+      commitPipeline,
+      events,
+      updateIndexingSeconds,
+      writeCheckpoint: (tx) =>
+        tx.wrap(
+          { label: "update_checkpoints" },
+          (tx) =>
+            tx
+              .insert(PONDER_CHECKPOINT)
+              .values({
+                chainName: chain.name,
+                chainId,
+                latestCheckpoint: checkpoint,
+                finalizedCheckpoint: checkpoint,
+                safeCheckpoint: checkpoint,
+              })
+              .onConflictDoUpdate({
+                target: PONDER_CHECKPOINT.chainName,
+                set: {
+                  safeCheckpoint: sql`excluded.safe_checkpoint`,
+                  finalizedCheckpoint: sql`excluded.finalized_checkpoint`,
+                  latestCheckpoint: sql`excluded.latest_checkpoint`,
+                },
+              }),
+          context,
+        ),
+      onCommitted: () =>
+        common.logger.info({
+          msg: "Indexed block range",
+          chain: chain.name,
+          chain_id: chain.id,
+          event_count: events.length,
+          block_range: JSON.stringify(blockRange),
+          duration: indexStartClock(),
+        }),
+    });
+    if (isPipelined) continue;
+
     indexingCache.qb = database.userQB;
     await Promise.all([
       indexingCache.prefetch({ events }),
@@ -326,25 +397,7 @@ export async function runIsolated({
 
           await indexing.processHistoricalEvents({
             events,
-            updateIndexingSeconds(event, chain) {
-              const checkpoint = decodeCheckpoint(event!.checkpoint);
-
-              common.metrics.ponder_historical_completed_indexing_seconds.set(
-                { chain: chain.name },
-                Math.max(
-                  Number(checkpoint.blockTimestamp) -
-                    Math.max(
-                      seconds[chain.name]!.cached,
-                      seconds[chain.name]!.start,
-                    ),
-                  0,
-                ),
-              );
-              common.metrics.ponder_indexing_timestamp.set(
-                { chain: chain.name },
-                Number(checkpoint.blockTimestamp),
-              );
-            },
+            updateIndexingSeconds,
           });
 
           indexingStore.isProcessingEvents = false;
@@ -461,6 +514,8 @@ export async function runIsolated({
       duration: indexStartClock(),
     });
   }
+
+  await commitPipeline.drain();
 
   indexingCache.clear();
   // Note: Invalidating the cache means that only predicted rows will be in memory after this point.

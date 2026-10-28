@@ -2,7 +2,10 @@ import util from "node:util";
 import type { Abi, Address } from "viem";
 import type { CachedViemClient } from "@/indexing/client.js";
 import type { IndexingCache } from "@/indexing-store/cache.js";
-import type { IndexingStore } from "@/indexing-store/index.js";
+import {
+  type IndexingStore,
+  PipelineFallbackError,
+} from "@/indexing-store/index.js";
 import type { Common } from "@/internal/common.js";
 import {
   BaseError,
@@ -65,7 +68,11 @@ declare global {
 }
 globalThis.DISABLE_EVENT_PROXY = false;
 
-const EVENT_LOOP_UPDATE_INTERVAL = 25;
+const EVENT_LOOP_UPDATE_INTERVAL = 1;
+/** Events per in-batch contract read prefetch. */
+const PREFETCH_WINDOW = 10_000;
+/** Minimum events between two prefetch refreshes after the profile changed. */
+const PREFETCH_REFRESH_INTERVAL = 250;
 const METRICS_UPDATE_INTERVAL = 100;
 
 export type Context = {
@@ -312,6 +319,11 @@ export const createIndexing = ({
         throw new ShutdownError();
       }
 
+      // Note: Internal signal to re-run the batch on the sequential path.
+      if (error instanceof PipelineFallbackError) {
+        throw error;
+      }
+
       if (error instanceof InvalidEventAccessError) {
         throw error;
       }
@@ -455,8 +467,37 @@ export const createIndexing = ({
       let lastEventLoopUpdate = performance.now();
       let lastMetricsUpdate = performance.now();
 
+      // Note: The batch was prefetched (by the caller) with the profile as it was before
+      // the batch. When the profile learns a pattern during the batch — always the case in
+      // the first batch — the events ahead are prefetched again, a window at a time, starting
+      // while the call that taught the pattern is still in flight.
+      let current = 0;
+      let prefetchedUntil = events.length;
+      let lastRefreshAt = Number.NEGATIVE_INFINITY;
+      const prefetchAhead = () => {
+        if (
+          prefetchedUntil < events.length &&
+          prefetchedUntil - current < PREFETCH_WINDOW / 2
+        ) {
+          const from = Math.max(prefetchedUntil, current + 1);
+          const to = Math.min(events.length, from + PREFETCH_WINDOW);
+          // Note: Not awaited; a handler awaits the in-flight request it needs.
+          client.prefetch({ events: events.slice(from, to) }).catch(() => {});
+          prefetchedUntil = to;
+        }
+      };
+      client.onProfileChange = () => {
+        if (current - lastRefreshAt < PREFETCH_REFRESH_INTERVAL) return;
+        lastRefreshAt = current;
+        prefetchedUntil = current + 1;
+        prefetchAhead();
+      };
+
       for (let i = 0; i < events.length; i++) {
         const event = events[i]!;
+
+        current = i;
+        prefetchAhead();
 
         client.event = event;
         indexingCache.event = event;
@@ -699,6 +740,7 @@ export const createIndexing = ({
         );
       }
 
+      client.onProfileChange = undefined;
       await new Promise(setImmediate);
       if (events.length > 0) {
         updateIndexingSeconds(
@@ -708,6 +750,7 @@ export const createIndexing = ({
       }
     },
     async processRealtimeEvents({ events }) {
+      client.onProfileChange = undefined;
       for (let i = 0; i < events.length; i++) {
         const event = events[i]!;
 

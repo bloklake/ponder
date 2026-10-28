@@ -7,6 +7,7 @@
     "create:app": "bun run src/create-app.ts"
   },
   "devDependencies": {
+    "apache-arrow": "^21.2.0",
     "commander": "^12.0.0",
     "drizzle-orm": "0.41.0",
     "pg": "^8.16.2",

@@ -240,3 +240,29 @@ export default createConfig({
   },
 });
 ```
+
+## Datalake
+
+Use the `datalake` option to backfill from a bloklake datalake instead of JSON-RPC. Ponder reads every block up to the datalake's archive height from it, including factory children, and uses the JSON-RPC endpoints for the blocks after that and for live indexing. Indexing functions and results are the same as with JSON-RPC alone.
+
+```ts [ponder.config.ts]
+import { createConfig } from "ponder";
+
+export default createConfig({
+  chains: {
+    mainnet: {
+      id: 1,
+      rpc: process.env.PONDER_RPC_URL_1,
+      datalake: { // [!code focus]
+        url: process.env.PONDER_DATALAKE_URL_1, // [!code focus]
+        apiKey: process.env.PONDER_DATALAKE_KEY, // [!code focus]
+      }, // [!code focus]
+    },
+  },
+});
+```
+
+- Blocks read from the datalake are not stored in the RPC cache (`ponder_sync`); a restart or redeploy reads them from the datalake again. Removing the option falls back to JSON-RPC for every block.
+- Contracts with call traces (`includeCallTraces`), native transfers, and accounts whose address is a factory are not supported by the datalake yet. A chain that uses them backfills from JSON-RPC and Ponder logs a warning.
+- The `ponder_datalake_request_duration`, `ponder_datalake_rows_total` and `ponder_datalake_archive_height` metrics report datalake usage.
+- If the datalake is unreachable at startup (for 30 seconds), Ponder logs a warning and backfills that chain from JSON-RPC. A failing request during the backfill (errors, timeouts, rate limiting, a datalake that is behind) is retried for up to 5 minutes, logging a warning per retry; after that Ponder exits with an error, and a restart resumes from the last indexed checkpoint.

@@ -9,6 +9,7 @@ export const getProfilePatternKey = (pattern: ProfilePattern): string => {
       address: pattern.address,
       functionName: pattern.functionName,
       args: pattern.args,
+      when: pattern.when,
     }),
     (_, value) => {
       if (typeof value === "bigint") {
@@ -36,7 +37,11 @@ export const recordProfilePattern = ({
 }): { pattern: ProfilePattern; hasConstant: boolean } | undefined => {
   globalThis.DISABLE_EVENT_PROXY = true;
 
+  const when = conditionOf(event);
   for (const hint of hints) {
+    if (hint.pattern.when !== undefined && hint.pattern.when !== when) {
+      continue;
+    }
     const request = recoverProfilePattern(hint.pattern, event);
     if (
       request.functionName === args.functionName &&
@@ -336,6 +341,7 @@ export const recordProfilePattern = ({
         functionName: args.functionName,
         args: undefined,
         cache: args.cache,
+        ...(hasConstant && when !== undefined ? { when } : {}),
       },
       hasConstant,
     };
@@ -723,10 +729,19 @@ export const recordProfilePattern = ({
       functionName: args.functionName,
       args: resultArgs,
       cache: args.cache,
+      ...(hasConstant && when !== undefined ? { when } : {}),
     },
     hasConstant,
   };
 };
+
+/**
+ * The contract a log event comes from. A constant in a call made for a log event (e.g. a token
+ * address a pool handler loads from the database) is usually fixed per contract, so constant
+ * patterns are recorded, and predicted, per contract.
+ */
+export const conditionOf = (event: Event): string | undefined =>
+  event.type === "log" ? event.event.log.address?.toLowerCase() : undefined;
 
 export const recoverProfilePattern = (
   pattern: ProfilePattern,

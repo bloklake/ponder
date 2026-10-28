@@ -228,34 +228,39 @@ export async function start({
 
   await database.migrateSync();
 
-  const apiResult = await build.executeApi({
-    preBuild: preCompileResult.result,
-    configBuild: configBuildResult.result,
-    database,
-  });
-  if (apiResult.status === "error") {
-    common.logger.error({
-      msg: "Build failed",
-      stage: "api",
-      error: apiResult.error,
+  // Note: Indexing does not use the API build; without an `onBuild` hook it starts before the
+  // API is built (executing it takes about half a second), and the server starts after.
+  const buildApi = async (): Promise<ApiBuild | undefined> => {
+    const apiResult = await build.executeApi({
+      preBuild: preCompileResult.result,
+      configBuild: configBuildResult.result,
+      database: database!,
     });
-    await exit({ code: 1 });
-    return;
-  }
+    if (apiResult.status === "error") {
+      common.logger.error({
+        msg: "Build failed",
+        stage: "api",
+        error: apiResult.error,
+      });
+      await exit({ code: 1 });
+      return undefined;
+    }
 
-  const apiBuildResult = await build.compileApi({
-    apiResult: apiResult.result,
-  });
-
-  if (apiBuildResult.status === "error") {
-    common.logger.error({
-      msg: "Build failed",
-      stage: "api",
-      error: apiBuildResult.error,
+    const apiBuildResult = await build.compileApi({
+      apiResult: apiResult.result,
     });
-    await exit({ code: 1 });
-    return;
-  }
+
+    if (apiBuildResult.status === "error") {
+      common.logger.error({
+        msg: "Build failed",
+        stage: "api",
+        error: apiBuildResult.error,
+      });
+      await exit({ code: 1 });
+      return undefined;
+    }
+    return apiBuildResult.result;
+  };
 
   metrics.ponder_settings_info.set(
     {
@@ -272,12 +277,15 @@ export async function start({
     namespaceBuild: namespaceResult.result,
     schemaBuild: compileSchemaResult.result,
     indexingBuild: indexingBuildResult.result,
-    apiBuild: apiBuildResult.result,
+    apiBuild: undefined as unknown as ApiBuild,
     crashRecoveryCheckpoint,
     database,
   };
 
   if (onBuild) {
+    const apiBuild = await buildApi();
+    if (apiBuild === undefined) return;
+    app.apiBuild = apiBuild;
     app = await onBuild(app);
   }
 
@@ -294,6 +302,12 @@ export async function start({
       isolatedController(app);
       break;
     }
+  }
+
+  if (onBuild === undefined) {
+    const apiBuild = await buildApi();
+    if (apiBuild === undefined) return;
+    app.apiBuild = apiBuild;
   }
 
   createServer(app);

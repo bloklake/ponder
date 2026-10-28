@@ -42,7 +42,23 @@ export type IndexingStore = {
   db: Db<Schema>;
   qb: QB;
   isProcessingEvents: boolean;
+  /**
+   * `true` while a batch runs in memory ahead of the previous batch's commit.
+   * Store methods that must reach the database then request a fallback.
+   */
+  isPipelined: boolean;
+  /** Set when a store method needed the database during a pipelined batch. */
+  isPipelineFallbackRequested: boolean;
 };
+
+/**
+ * Internal: thrown by store methods that need the database while a batch is
+ * processed ahead of the previous batch's commit. The batch is then re-run on the
+ * sequential path, so users never observe it.
+ */
+export class PipelineFallbackError extends Error {
+  override name = "PipelineFallbackError";
+}
 
 export const validateUpdateSet = (
   table: Table,
@@ -114,6 +130,17 @@ export const createIndexingStore = ({
 }): IndexingStore => {
   let qb: QB = undefined!;
   let isProcessingEvents = true;
+  let isPipelined = false;
+  let isPipelineFallbackRequested = false;
+
+  const requirePipelineFallback = () => {
+    if (isPipelined) {
+      isPipelineFallbackRequested = true;
+      throw new PipelineFallbackError(
+        "Store method requires the database during a pipelined batch",
+      );
+    }
+  };
 
   const tables = Object.values(schema).filter(isTable);
   const views = Object.values(schema).filter(isView);
@@ -137,7 +164,7 @@ export const createIndexingStore = ({
             "A store API method (find, update, insert, delete) was called after the indexing function returned. Hint: Did you forget to await the store API method call (an unawaited promise)?",
           );
         }
-        await lock.lock();
+        if (lock.tryLock() === false) await lock.lock();
         const result = await fn(...args);
         // @ts-expect-error typescript bug lol
         if (isProcessingEvents === false) {
@@ -586,6 +613,7 @@ export const createIndexingStore = ({
         };
       },
       delete: storeMethodWrapper(async (table: Table, key) => {
+        requirePipelineFallback();
         common.metrics.incrementIndexingStoreQueries(
           getTableName(table),
           "delete",
@@ -597,6 +625,7 @@ export const createIndexingStore = ({
       // @ts-expect-error
       sql: drizzle(
         storeMethodWrapper(async (_sql, params, method, typings) => {
+          requirePipelineFallback();
           const isSelectOnly = await isReadonlySQLQuery(_sql);
 
           if (isSelectOnly === false) {
@@ -666,6 +695,13 @@ export const createIndexingStore = ({
     },
     set isProcessingEvents(_isProcessingEvents: boolean) {
       isProcessingEvents = _isProcessingEvents;
+    },
+    set isPipelined(_isPipelined: boolean) {
+      isPipelined = _isPipelined;
+      isPipelineFallbackRequested = false;
+    },
+    get isPipelineFallbackRequested() {
+      return isPipelineFallbackRequested;
     },
   };
 };

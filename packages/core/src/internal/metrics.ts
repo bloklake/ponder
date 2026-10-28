@@ -111,6 +111,10 @@ export class MetricsService {
   ponder_rpc_request_duration: prometheus.Histogram<"chain" | "method">;
   ponder_rpc_request_error_total: prometheus.Counter<"chain" | "method">;
 
+  ponder_datalake_request_duration: prometheus.Histogram<"chain" | "kind">;
+  ponder_datalake_rows_total: prometheus.Counter<"chain">;
+  ponder_datalake_archive_height: prometheus.Gauge<"chain">;
+
   ponder_postgres_query_total: prometheus.Counter<"pool">;
   ponder_postgres_query_queue_size: prometheus.Gauge<"pool"> = null!;
   ponder_postgres_pool_connections: prometheus.Gauge<"pool" | "kind"> = null!;
@@ -425,6 +429,29 @@ export class MetricsService {
       buckets: alwaysIODurationMs,
       registers: [this.registry],
       aggregator: "sum",
+    });
+
+    this.ponder_datalake_request_duration = new prometheus.Histogram({
+      name: "ponder_datalake_request_duration",
+      help: "Duration of datalake requests (events, factory children)",
+      labelNames: ["chain", "kind"] as const,
+      buckets: alwaysIODurationMs,
+      registers: [this.registry],
+      aggregator: "sum",
+    });
+    this.ponder_datalake_rows_total = new prometheus.Counter({
+      name: "ponder_datalake_rows_total",
+      help: "Rows (blocks, transactions, logs) read from the datalake",
+      labelNames: ["chain"] as const,
+      registers: [this.registry],
+      aggregator: "sum",
+    });
+    this.ponder_datalake_archive_height = new prometheus.Gauge({
+      name: "ponder_datalake_archive_height",
+      help: "Archive height of the datalake used for backfill",
+      labelNames: ["chain"] as const,
+      registers: [this.registry],
+      aggregator: "max",
     });
 
     this.ponder_rpc_request_error_total = new prometheus.Counter({

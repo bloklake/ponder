@@ -59,6 +59,8 @@ export class PgText<
   }
 
   override mapToDriverValue(value: string) {
+    // Note: fast path for the common case, same result as below.
+    if (typeof value === "string" && value.indexOf("\0") === -1) return value;
     // Note: swallow errors because drizzle will throw a more specific error if the value is invalid
     try {
       if (value.match(/\0/g)) {

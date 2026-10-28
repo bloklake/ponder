@@ -71,6 +71,7 @@ import {
   getLocalSyncProgress,
   type SyncProgress,
 } from "./index.js";
+import { createCommitPipeline, indexBatchPipelined } from "./pipeline.js";
 import { getRealtimeEventsOmnichain } from "./realtime.js";
 
 export async function runOmnichain({
@@ -165,6 +166,7 @@ export async function runOmnichain({
         indexingBuild.eventCallbacks[indexingBuild.chains.indexOf(chain)]!;
 
       const cachedIntervals = await getCachedIntervals({
+        common,
         chain,
         filters: eventCallbacks.map(({ filter }) => filter),
         syncStore,
@@ -179,6 +181,7 @@ export async function runOmnichain({
         cachedIntervals,
       });
       const childAddresses = await getChildAddresses({
+        common,
         chain,
         filters: eventCallbacks.map(({ filter }) => filter),
         syncStore,
@@ -321,6 +324,31 @@ export async function runOmnichain({
 
   const backfillEndClock = startClock();
 
+  const updateIndexingSeconds = (event: Event) => {
+    const checkpoint = decodeCheckpoint(event.checkpoint);
+    for (const chain of indexingBuild.chains) {
+      common.metrics.ponder_historical_completed_indexing_seconds.set(
+        { chain: chain.name },
+        Math.min(
+          Math.max(
+            Number(checkpoint.blockTimestamp) -
+              Math.max(seconds[chain.name]!.cached, seconds[chain.name]!.start),
+            0,
+          ),
+          Math.max(seconds[chain.name]!.end - seconds[chain.name]!.start, 0),
+        ),
+      );
+      common.metrics.ponder_indexing_timestamp.set(
+        { chain: chain.name },
+        Math.max(Number(checkpoint.blockTimestamp), seconds[chain.name]!.end),
+      );
+    }
+  };
+
+  // Note: See `indexBatchPipelined`. Batches fall back to the sequential path
+  // below whenever pipelining does not apply.
+  const commitPipeline = createCommitPipeline();
+
   let pendingEvents: Event[] = [];
 
   // Run historical indexing until complete.
@@ -358,6 +386,56 @@ export async function runOmnichain({
       (a, b) => (a.checkpoint < b.checkpoint ? -1 : 1),
     );
 
+    const isPipelined = await indexBatchPipelined({
+      common,
+      database,
+      indexing,
+      indexingStore,
+      indexingCache,
+      cachedViemClient,
+      commitPipeline,
+      events,
+      updateIndexingSeconds,
+      writeCheckpoint: (tx) =>
+        tx.wrap({ label: "update_checkpoints" }, (tx) =>
+          tx
+            .insert(PONDER_CHECKPOINT)
+            .values(
+              result.result.map(({ chainId, checkpoint }) => ({
+                chainName: indexingBuild.chains.find(
+                  (chain) => chain.id === chainId,
+                )!.name,
+                chainId,
+                latestCheckpoint: checkpoint,
+                safeCheckpoint: checkpoint,
+                finalizedCheckpoint: checkpoint,
+              })),
+            )
+            .onConflictDoUpdate({
+              target: PONDER_CHECKPOINT.chainName,
+              set: {
+                safeCheckpoint: sql`excluded.safe_checkpoint`,
+                latestCheckpoint: sql`excluded.latest_checkpoint`,
+                finalizedCheckpoint: sql`excluded.finalized_checkpoint`,
+              },
+            }),
+        ),
+      onCommitted: () => {
+        for (const { chainId, events, blockRange } of result.result) {
+          common.logger.info({
+            msg: "Indexed block range",
+            chain: indexingBuild.chains.find((chain) => chain.id === chainId)!
+              .name,
+            chain_id: chainId,
+            event_count: events.length,
+            block_range: JSON.stringify(blockRange),
+            duration: indexStartClock(),
+          });
+        }
+      },
+    });
+    if (isPipelined) continue;
+
     indexingCache.qb = database.userQB;
     await Promise.all([
       indexingCache.prefetch({ events }),
@@ -388,35 +466,7 @@ export async function runOmnichain({
 
           await indexing.processHistoricalEvents({
             events,
-            updateIndexingSeconds(event) {
-              const checkpoint = decodeCheckpoint(event.checkpoint);
-              for (const chain of indexingBuild.chains) {
-                common.metrics.ponder_historical_completed_indexing_seconds.set(
-                  { chain: chain.name },
-                  Math.min(
-                    Math.max(
-                      Number(checkpoint.blockTimestamp) -
-                        Math.max(
-                          seconds[chain.name]!.cached,
-                          seconds[chain.name]!.start,
-                        ),
-                      0,
-                    ),
-                    Math.max(
-                      seconds[chain.name]!.end - seconds[chain.name]!.start,
-                      0,
-                    ),
-                  ),
-                );
-                common.metrics.ponder_indexing_timestamp.set(
-                  { chain: chain.name },
-                  Math.max(
-                    Number(checkpoint.blockTimestamp),
-                    seconds[chain.name]!.end,
-                  ),
-                );
-              }
-            },
+            updateIndexingSeconds,
           });
 
           indexingStore.isProcessingEvents = false;
@@ -528,6 +578,8 @@ export async function runOmnichain({
       });
     }
   }
+
+  await commitPipeline.drain();
 
   indexingCache.clear();
   // Note: Invalidating the cache means that only predicted rows will be in memory after this point.

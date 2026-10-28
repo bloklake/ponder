@@ -119,6 +119,17 @@ type ChainConfig<chain> = {
    * attempt to determine the block range automatically based on error messages.
    */
   ethGetLogsBlockRange?: number;
+  /**
+   * bloklake datalake to backfill from instead of JSON-RPC, up to the datalake's archive
+   * height (JSON-RPC is still used above it and for live indexing). Indexing functions and
+   * results are unchanged.
+   */
+  datalake?: {
+    /** Datalake API base URL, e.g. `https://api.example.com/4663`. */
+    url: string;
+    /** API key sent as `X-BL-Api-Key`. */
+    apiKey?: string;
+  };
 };
 
 type ChainsConfig<chains> = {} extends chains

@@ -120,3 +120,21 @@ test("sanitizeLogTopics preserves omitted and empty topics", () => {
   expect(sanitizeLogTopics([])).toStrictEqual([]);
   expect(sanitizeLogTopics([null, null])).toStrictEqual([]);
 });
+
+test("createRpc() ramps up the request rate with slow start", async () => {
+  const chain = getChain();
+  const rpc = createRpc({
+    common: context.common,
+    chain,
+  });
+
+  // Note: With the initial limit of 20 RPS and 5% steps this takes ~15s; slow start
+  // doubles the limit every saturated second (20, 40, 80, 160, ...).
+  const start = Date.now();
+  await Promise.all(
+    Array.from({ length: 300 }, () =>
+      rpc.request({ method: "eth_blockNumber" }),
+    ),
+  );
+  expect(Date.now() - start).toBeLessThan(8_000);
+}, 20_000);
